@@ -747,7 +747,7 @@ def train(args):
             optimizers[0] = optimizer
             lr_schedulers[0] = lr_scheduler
 
-    if args.fused_optimizer_groups:
+    if args.fused_optimizer_groups and not args.fused_backward_pass:
         # prepare additional optimizers and lr schedulers for fused backward pass
         for i in range(1, len(optimizers)):
             optimizers[i] = accelerator.prepare(optimizers[i])
@@ -806,6 +806,23 @@ def train(args):
 
     # resume
     train_util.resume_from_local_or_hf_if_specified(accelerator, args)
+
+    if args.fused_backward_pass:
+        # use fused optimizer for backward pass: other optimizers will be supported in the future
+        import library.adafactor_fused
+
+        library.adafactor_fused.patch_adafactor_fused(optimizer)
+        for param_group in optimizer.param_groups:
+            for parameter in param_group["params"]:
+                if parameter.requires_grad:
+
+                    def __grad_hook(tensor: torch.Tensor, param_group=param_group):
+                        if accelerator.sync_gradients and args.max_grad_norm != 0.0:
+                            accelerator.clip_grad_norm_(tensor, args.max_grad_norm)
+                        optimizer.step_param(tensor, param_group)
+                        tensor.grad = None
+
+                    parameter.register_post_accumulate_grad_hook(__grad_hook)
 
     # epochs calculation
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
