@@ -129,6 +129,8 @@ class LoFTModule(torch.nn.Module):
         if update_u:
             # scale grad_U := grad_U @ (V^T V + eps I)^{-1}
             def _u_grad_hook(grad: torch.Tensor) -> torch.Tensor:
+                if not getattr(self, "_use_full", True):
+                    return grad
                 Vt = self._to_2d(self.lora_down.weight)  # [r, in*kw*kh]
                 Vt32 = Vt.float()
                 gram32 = Vt32 @ Vt32.t()  # [r, r] == V^T V
@@ -145,6 +147,8 @@ class LoFTModule(torch.nn.Module):
         else:
             # scale grad_{V^T} := (U^T U + eps I)^{-1} @ grad_{V^T}
             def _v_grad_hook(grad: torch.Tensor) -> torch.Tensor:
+                if not getattr(self, "_use_full", True):
+                    return grad
                 U = self._to_2d(self.lora_up.weight)  # [out, r]
                 U32 = U.float()
                 gram32 = U32.t() @ U32  # [r, r] == U^T U
@@ -205,6 +209,7 @@ class LoFTNetwork(torch.nn.Module):
         self.dropout = dropout
         self.is_sdxl = is_sdxl
         self._update_u = False  # will be set on first step in prepare_grad_etc
+        self._adamw_full = False
 
         def create_modules(
             is_unet: bool,
@@ -361,6 +366,25 @@ class LoFTNetwork(torch.nn.Module):
 
     def get_trainable_params(self):
         return self.parameters()
+
+    def prepare_network(self, args):
+        opt = getattr(args, "optimizer_type", None)
+        if opt is None or opt == "":
+            self._adamw_full = True
+        else:
+            self._adamw_full = opt.lower() == "adamw"
+
+        if self._adamw_full:
+            logger.info("LoFT: using AdamW full behavior (projection hooks enabled)")
+        else:
+            logger.info(f"LoFT: AdamW full disabled for optimizer_type='{opt}' (projection hooks disabled)")
+
+        use_full = bool(self._adamw_full)
+        for m in self.text_encoder_lofts + self.unet_lofts:
+            try:
+                setattr(m, "_use_full", use_full)
+            except Exception:
+                pass
 
     def save_weights(self, file: str, dtype: Optional[torch.dtype], metadata: Optional[Dict[str, str]]):
         if metadata is not None and len(metadata) == 0:
