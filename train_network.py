@@ -26,6 +26,18 @@ from accelerate import Accelerator
 from diffusers import DDPMScheduler
 from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
 from library import deepspeed_utils, model_util, sai_model_spec, strategy_base, strategy_sd, sai_model_spec
+try:
+    from library import srpo_train_utils, srpo_reward_models
+    SRPO_AVAILABLE = True
+except ImportError:
+    SRPO_AVAILABLE = False
+
+try:
+    from library import neon_train_utils
+    NEON_AVAILABLE = True
+except ImportError:
+    NEON_AVAILABLE = False
+    logger.warning("SRPO modules not available. SRPO training will be disabled.")
 
 import library.train_util as train_util
 from library.train_util import DreamBoothDataset
@@ -1276,7 +1288,7 @@ class NetworkTrainer:
 
         noise_scheduler = self.get_noise_scheduler(args, accelerator.device)
 
-        train_util.init_trackers(accelerator, args, "network_train")
+        train_util.init_trackers(accelerator, args, args.output_name or "network_train")
 
         loss_recorder = train_util.LossRecorder()
         val_step_loss_recorder = train_util.LossRecorder()
@@ -1899,6 +1911,140 @@ def setup_parser() -> argparse.ArgumentParser:
         default=None,
         help="Max number of validation dataset items processed. By default, validation will run the entire validation dataset / 処理される検証データセット項目の最大数。デフォルトでは、検証は検証データセット全体を実行します",
     )
+    
+    # SRPO (Style Reward Preference Optimization) arguments
+    parser.add_argument(
+        "--srpo_enable",
+        action="store_true",
+        help="Enable SRPO (Self-Reinforced Preference Optimization) training / SRPO（自己強化選好最適化）トレーニングを有効化",
+    )
+    parser.add_argument(
+        "--srpo_use_reward_model",
+        action="store_true",
+        default=True,
+        help="Use reward model for preference guidance. Disable for styles (e.g., anime) where existing models are biased / 選好ガイダンスに報酬モデルを使用。既存モデルにバイアスがあるスタイル（アニメなど）では無効化",
+    )
+    parser.add_argument(
+        "--srpo_reward_model",
+        type=str,
+        default="HPS",
+        choices=["HPS", "PickScore", "CLIP"],
+        help="Reward model for SRPO training (HPS/PickScore/CLIP, only used if --srpo_use_reward_model is True) / SRPOトレーニングの報酬モデル（HPS/PickScore/CLIP、--srpo_use_reward_modelがTrueの場合のみ使用）",
+    )
+    parser.add_argument(
+        "--srpo_timestep_length",
+        type=int,
+        default=100,
+        help="Number of timesteps for SRPO training / SRPO学習のタイムステップ数",
+    )
+    parser.add_argument(
+        "--srpo_discount_pos",
+        type=float,
+        nargs=2,
+        default=[0.1, 0.25],
+        help="Discount range for positive branch [start, end] / ポジティブブランチの割引範囲 [開始, 終了]",
+    )
+    parser.add_argument(
+        "--srpo_discount_inv",
+        type=float,
+        nargs=2,
+        default=[0.3, 0.01],
+        help="Discount range for inversion branch [start, end] / インバージョンブランチの割引範囲 [開始, 終了]",
+    )
+    parser.add_argument(
+        "--srpo_train_timestep",
+        type=int,
+        nargs=2,
+        default=[5, 25],
+        help="Timestep range for training [start, end] / 学習のタイムステップ範囲 [開始, 終了]",
+    )
+    parser.add_argument(
+        "--srpo_groundtruth_ratio",
+        type=float,
+        default=0.9,
+        help="Groundtruth ratio for image recovery / 画像復元のグラウンドトゥルース比率",
+    )
+    parser.add_argument(
+        "--srpo_guidance_scale",
+        type=float,
+        default=3.5,
+        help="Guidance scale for SRPO sampling / SRPOサンプリングのガイダンススケール",
+    )
+    parser.add_argument(
+        "--srpo_reward_threshold",
+        type=float,
+        default=0.7,
+        help="Reward threshold for ReLU loss (prevents reward hacking) / ReLU損失の報酬閾値（報酬ハッキング防止）",
+    )
+    parser.add_argument(
+        "--srpo_positive_controls",
+        type=str,
+        nargs="*",
+        default=None,
+        help="Comma-separated list of positive control words for style preference (e.g., 'Detailed,Natural-lighting,Real'). If not specified, uses default realism adjectives / スタイル嗜好のポジティブ制御ワードのコンマ区切りリスト（例: 'Detailed,Natural-lighting,Real'）。指定しない場合、デフォルトのリアリズム形容詞を使用",
+    )
+    parser.add_argument(
+        "--srpo_negative_controls",
+        type=str,
+        nargs="*",
+        default=None,
+        help="Comma-separated list of negative control words for style preference (e.g., 'Flat,Anime,Painting'). If not specified, uses default CG/oily adjectives / スタイル嗜好のネガティブ制御ワードのコンマ区切りリスト（例: 'Flat,Anime,Painting'）。指定しない場合、デフォルトのCG/oily形容詞を使用",
+    )
+    
+    # Neon (Negative Extrapolation from Self-Training) arguments
+    parser.add_argument(
+        "--neon_enable",
+        action="store_true",
+        help="Enable Neon automatic post-training (generates synthetic data + post-trains + merges) / Neon自動ポストトレーニングを有効化（合成データ生成 + ポストトレーニング + マージ）",
+    )
+    parser.add_argument(
+        "--neon_save_pre_post",
+        action="store_true",
+        help="Save model before Neon post-training (appends '_neon_pre' suffix) / Neonポストトレーニング前のモデルを保存（'_neon_pre'サフィックスを追加）",
+    )
+    parser.add_argument(
+        "--neon_synthetic_dataset_dir",
+        type=str,
+        default=None,
+        help="Directory to save synthetic dataset (default: ./output/neon_synthetic) / 合成データセットを保存するディレクトリ（デフォルト: ./output/neon_synthetic）",
+    )
+    parser.add_argument(
+        "--neon_post_training_epochs",
+        type=int,
+        default=0,
+        help="Number of epochs for Neon post-training (0 = use steps instead) / Neonポストトレーニングのエポック数（0 = 代わりにステップを使用）",
+    )
+    parser.add_argument(
+        "--neon_post_training_steps",
+        type=int,
+        default=100,
+        help="Number of steps for Neon post-training (used if epochs=0, default: 100) / Neonポストトレーニングのステップ数（エポック=0の場合使用、デフォルト: 100）",
+    )
+    parser.add_argument(
+        "--neon_synthetic_image_percent",
+        type=float,
+        default=100.0,
+        help="Percentage of original images to generate as synthetic (100.0 = same count, includes repeats) / 合成画像として生成する元画像の割合（100.0 = 同じカウント、リピートを含む）",
+    )
+    parser.add_argument(
+        "--neon_extrapolation_weight",
+        type=float,
+        default=0.3,
+        help="Neon extrapolation weight w: θ_neon = (1+w)θ_base - wθ_aux. Typical range: 0.1-0.5 (default: 0.3) / Neon外挿重み w: θ_neon = (1+w)θ_base - wθ_aux。一般的な範囲: 0.1-0.5（デフォルト: 0.3）",
+    )
+    parser.add_argument(
+        "--neon_guidance_scale",
+        type=float,
+        default=7.5,
+        help="Guidance scale for synthetic image generation (default: 7.5) / 合成画像生成のガイダンススケール（デフォルト: 7.5）",
+    )
+    parser.add_argument(
+        "--neon_inference_steps",
+        type=int,
+        default=28,
+        help="Number of inference steps for synthetic image generation (default: 28) / 合成画像生成の推論ステップ数（デフォルト: 28）",
+    )
+    
     return parser
 
 
