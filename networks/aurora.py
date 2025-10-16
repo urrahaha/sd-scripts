@@ -431,6 +431,51 @@ def create_network(
         is_sdxl=is_sdxl,
     )
 
+    # Apply optional spline settings from kwargs to all created modules
+    spline_gate = kwargs.get("spline_gate", None)
+    spline_scale = kwargs.get("spline_scale", None)
+    spline_centers = kwargs.get("spline_centers", None)
+
+    def _parse_centers(val, K):
+        if val is None:
+            return None
+        if isinstance(val, (list, tuple)):
+            arr = [float(x) for x in val]
+        else:
+            try:
+                arr = [float(x.strip()) for x in str(val).split(",") if x.strip() != ""]
+            except Exception:
+                return None
+        if len(arr) < 1:
+            return None
+        # If length mismatches, truncate/pad to K
+        if len(arr) < K:
+            arr = arr + [arr[-1]] * (K - len(arr))
+        elif len(arr) > K:
+            arr = arr[:K]
+        return torch.tensor(arr)
+
+    if spline_gate is not None or spline_scale is not None or spline_centers is not None:
+        loras = []
+        loras.extend(getattr(network, "text_encoder_loras", []))
+        loras.extend(getattr(network, "unet_loras", []))
+        for m in loras:
+            if hasattr(m, "spline_gate"):
+                if spline_gate is not None:
+                    try:
+                        m.spline_gate.data = torch.tensor(float(spline_gate))
+                    except Exception:
+                        pass
+                if spline_scale is not None and hasattr(m, "spline_scale"):
+                    try:
+                        m.spline_scale.data = torch.tensor(float(spline_scale))
+                    except Exception:
+                        pass
+                if spline_centers is not None and hasattr(m, "spline_centers"):
+                    centers_t = _parse_centers(spline_centers, getattr(m, "spline_k", 4))
+                    if centers_t is not None:
+                        m.spline_centers.data = centers_t
+
     loraplus_lr_ratio = kwargs.get("loraplus_lr_ratio", None)
     loraplus_unet_lr_ratio = kwargs.get("loraplus_unet_lr_ratio", None)
     loraplus_text_encoder_lr_ratio = kwargs.get("loraplus_text_encoder_lr_ratio", None)
