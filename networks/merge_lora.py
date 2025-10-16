@@ -84,30 +84,44 @@ def merge_to_sd_model(text_encoder, unet, models, ratios, merge_dtype):
                 down_weight = lora_sd[key]
                 up_weight = lora_sd[up_key]
 
+                h_key = key.replace("lora_down", "anl_H")
+                has_anl = h_key in lora_sd
+                if has_anl:
+                    H = lora_sd[h_key]
+                    if len(down_weight.size()) == 2:
+                        A = down_weight
+                        A1 = torch.tanh(A)
+                        A_tilde = torch.tanh(H @ A1)
+                    elif down_weight.size()[2:4] == (1, 1):
+                        H2 = H.squeeze(3).squeeze(2)
+                        A1 = torch.tanh(down_weight)
+                        A_tilde = torch.tanh(torch.einsum("or,rihw->oihw", H2, A1))
+                    else:
+                        H2 = H.squeeze(3).squeeze(2)
+                        A1 = torch.tanh(down_weight)
+                        A_tilde = torch.tanh(torch.einsum("or,rihw->oihw", H2, A1))
+                else:
+                    A_tilde = down_weight
+
                 dim = down_weight.size()[0]
                 alpha = lora_sd.get(alpha_key, dim)
                 scale = alpha / dim
 
-                # W <- W + U * D
                 weight = module.weight
                 if len(weight.size()) == 2:
-                    # linear
-                    if len(up_weight.size()) == 4:  # use linear projection mismatch
+                    if len(up_weight.size()) == 4:
                         up_weight = up_weight.squeeze(3).squeeze(2)
-                        down_weight = down_weight.squeeze(3).squeeze(2)
-                    weight = weight + ratio * (up_weight @ down_weight) * scale
+                        A_tilde = A_tilde.squeeze(3).squeeze(2)
+                    weight = weight + ratio * (up_weight @ A_tilde) * scale
                 elif down_weight.size()[2:4] == (1, 1):
-                    # conv2d 1x1
                     weight = (
                         weight
                         + ratio
-                        * (up_weight.squeeze(3).squeeze(2) @ down_weight.squeeze(3).squeeze(2)).unsqueeze(2).unsqueeze(3)
+                        * (up_weight.squeeze(3).squeeze(2) @ A_tilde.squeeze(3).squeeze(2)).unsqueeze(2).unsqueeze(3)
                         * scale
                     )
                 else:
-                    # conv2d 3x3
-                    conved = torch.nn.functional.conv2d(down_weight.permute(1, 0, 2, 3), up_weight).permute(1, 0, 2, 3)
-                    # logger.info(conved.size(), weight.size(), module.stride, module.padding)
+                    conved = torch.nn.functional.conv2d(A_tilde.permute(1, 0, 2, 3), up_weight).permute(1, 0, 2, 3)
                     weight = weight + ratio * conved * scale
 
                 module.weight = torch.nn.Parameter(weight)
