@@ -8,6 +8,11 @@ from library.device_utils import init_ipex, clean_memory_on_device
 init_ipex()
 
 from library import sdxl_model_util, sdxl_train_util, strategy_base, strategy_sd, strategy_sdxl, train_util
+try:
+    from library import srpo_train_utils, srpo_reward_models
+    SRPO_AVAILABLE = True
+except Exception:
+    SRPO_AVAILABLE = False
 import train_network
 from library.utils import setup_logging
 
@@ -22,6 +27,8 @@ class SdxlNetworkTrainer(train_network.NetworkTrainer):
         super().__init__()
         self.vae_scale_factor = sdxl_model_util.VAE_SCALE_FACTOR
         self.is_sdxl = True
+        self._srpo_reward_model = None
+        self._srpo_step = 0
 
     def assert_extra_args(
         self,
@@ -178,6 +185,119 @@ class SdxlNetworkTrainer(train_network.NetworkTrainer):
             # logger.info("text encoder outputs verified")
 
         return encoder_hidden_states1, encoder_hidden_states2, pool2
+
+    def on_step_start(self, args, accelerator, network, text_encoders, unet, batch, weight_dtype, is_train: bool = True):
+        if getattr(args, 'srpo_enable', False) and SRPO_AVAILABLE and self._srpo_reward_model is None:
+            # Validate SRPO args once
+            try:
+                srpo_train_utils.validate_srpo_args(args)
+            except Exception:
+                pass
+            # Build reward model
+            try:
+                self._srpo_reward_model = srpo_reward_models.build_reward_model(
+                    getattr(args, 'srpo_reward_model', 'HPS'),
+                    device=str(accelerator.device),
+                    dtype=weight_dtype,
+                )
+            except Exception as e:
+                logger.warning(f"SRPO: failed to initialize reward model: {e}. Disabling SRPO for this run.")
+                setattr(args, 'srpo_enable', False)
+
+    def process_batch(
+        self,
+        batch,
+        text_encoders,
+        unet,
+        network,
+        vae,
+        noise_scheduler,
+        vae_dtype,
+        weight_dtype,
+        accelerator,
+        args,
+        text_encoding_strategy: strategy_base.TextEncodingStrategy,
+        tokenize_strategy: strategy_base.TokenizeStrategy,
+        is_train=True,
+        train_text_encoder=True,
+        train_unet=True,
+    ) -> torch.Tensor:
+        # Use SRPO Direct-Align when enabled and available
+        if getattr(args, 'srpo_enable', False) and SRPO_AVAILABLE:
+            # Prepare text encoder outputs (reuse existing pipeline)
+            text_encoder_conds: list[torch.Tensor] = []
+            text_encoder_outputs_list = batch.get("text_encoder_outputs_list", None)
+            if text_encoder_outputs_list is not None:
+                text_encoder_conds = text_encoder_outputs_list
+
+            if len(text_encoder_conds) == 0 or text_encoder_conds[0] is None or train_text_encoder:
+                with torch.set_grad_enabled(is_train and train_text_encoder), accelerator.autocast():
+                    if args.weighted_captions:
+                        input_ids_list, weights_list = tokenize_strategy.tokenize_with_weights(batch["captions"])
+                        encoded_text_encoder_conds = text_encoding_strategy.encode_tokens_with_weights(
+                            tokenize_strategy,
+                            self.get_models_for_text_encoding(args, accelerator, text_encoders),
+                            input_ids_list,
+                            weights_list,
+                        )
+                    else:
+                        input_ids = [ids.to(accelerator.device) for ids in batch["input_ids_list"]]
+                        encoded_text_encoder_conds = text_encoding_strategy.encode_tokens(
+                            tokenize_strategy,
+                            self.get_models_for_text_encoding(args, accelerator, text_encoders),
+                            input_ids,
+                        )
+                    if args.full_fp16:
+                        encoded_text_encoder_conds = [c.to(weight_dtype) for c in encoded_text_encoder_conds]
+
+                if len(text_encoder_conds) == 0:
+                    text_encoder_conds = encoded_text_encoder_conds
+                else:
+                    for i in range(len(encoded_text_encoder_conds)):
+                        if encoded_text_encoder_conds[i] is not None:
+                            text_encoder_conds[i] = encoded_text_encoder_conds[i]
+
+            # Unpack TE outputs for SDXL
+            encoder_hidden_states1, encoder_hidden_states2, pool2 = text_encoder_conds
+
+            # Call SRPO training step (returns differentiable scalar loss)
+            loss = srpo_train_utils.srpo_train_step_sdxl(
+                args,
+                unet,
+                vae,
+                text_encoders[0],
+                text_encoders[1],
+                self._srpo_reward_model,
+                noise_scheduler,
+                batch,
+                self._srpo_step,
+                device=str(accelerator.device),
+                weight_dtype=weight_dtype,
+                precomputed_encoder_hidden_states1=encoder_hidden_states1,
+                precomputed_encoder_hidden_states2=encoder_hidden_states2,
+                precomputed_pooled_prompt_embeds=pool2,
+            )
+            self._srpo_step += 1
+            return loss
+
+        # Fallback to default training when SRPO is disabled or unavailable
+        return super().process_batch(
+            batch,
+            text_encoders,
+            unet,
+            network,
+            vae,
+            noise_scheduler,
+            vae_dtype,
+            weight_dtype,
+            accelerator,
+            args,
+            text_encoding_strategy,
+            tokenize_strategy,
+            is_train,
+            train_text_encoder,
+            train_unet,
+        )
 
     def call_unet(
         self,

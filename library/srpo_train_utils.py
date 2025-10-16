@@ -3,6 +3,7 @@ SRPO (Style Reward Preference Optimization) Training Utilities for SDXL
 Based on: https://github.com/Tencent-Hunyuan/SRPO
 
 Implements direct alignment of diffusion trajectory with reward models.
+Adds Direct-Align closed-form one-step recovery for SDXL.
 """
 
 import torch
@@ -36,6 +37,19 @@ def sdxl_euler_step(
     dt = prev_timestep - timestep
     prev_sample = latents + dt.view(-1, 1, 1, 1) * model_output
     return prev_sample
+
+
+def _alpha_sigma_from_scheduler(scheduler, t_index: int, device, dtype):
+    """Get alpha_t and sigma_t from scheduler.alphas_cumprod at integer index."""
+    ac = scheduler.alphas_cumprod
+    if not torch.is_tensor(ac):
+        ac = torch.tensor(ac, device=device)
+    ac = ac.to(device=device, dtype=dtype)
+    t_index = int(max(0, min(int(t_index), ac.shape[0] - 1)))
+    alpha_cum = ac[t_index]
+    alpha_t = torch.sqrt(alpha_cum)
+    sigma_t = torch.sqrt(torch.clamp(1.0 - alpha_cum, min=0.0))
+    return alpha_t, sigma_t
 
 
 def run_sdxl_sample_step(
@@ -119,32 +133,14 @@ def srpo_train_step_sdxl(
     global_step,
     device="cuda",
     weight_dtype=torch.float32,
+    precomputed_encoder_hidden_states1: Optional[torch.Tensor] = None,
+    precomputed_encoder_hidden_states2: Optional[torch.Tensor] = None,
+    precomputed_pooled_prompt_embeds: Optional[torch.Tensor] = None,
 ):
     """
-    Single SRPO training step for SDXL
-    
-    Implements the Direct-Align strategy:
-    1. Online rollout: Generate image from noise
-    2. Inject noise at intermediate timestep
-    3. Inverse/Denoise one step with gradients
-    4. Recover image and compute reward (optional, based on reward_model)
-    5. Backpropagate through the process
-    
-    Args:
-        args: Training arguments with SRPO parameters
-        unet: SDXL UNet (trainable)
-        vae: VAE decoder
-        text_encoder1: CLIP text encoder
-        text_encoder2: OpenCLIP text encoder
-        reward_model: Reward model (HPS/PickScore/CLIP), or None to disable reward-based guidance
-        scheduler: Noise scheduler
-        batch: Training batch data
-        global_step: Current training step
-        device: torch device
-        weight_dtype: Weight dtype
-    
-    Returns:
-        loss: SRPO loss value
+    Single SRPO training step for SDXL using Direct-Align closed-form.
+
+    Returns a differentiable scalar loss tensor (do not call backward here).
     """
     # Get SRPO parameters
     timestep_length = getattr(args, 'srpo_timestep_length', 100)
@@ -154,7 +150,6 @@ def srpo_train_step_sdxl(
     groundtruth_ratio = getattr(args, 'srpo_groundtruth_ratio', 0.9)
     guidance_scale = getattr(args, 'srpo_guidance_scale', 3.5)
     reward_threshold = getattr(args, 'srpo_reward_threshold', 0.7)
-    gradient_accumulation_steps = args.gradient_accumulation_steps
     
     # Get custom control words (fall back to defaults if not provided)
     pos_control_words = getattr(args, 'srpo_positive_controls', None)
@@ -164,15 +159,26 @@ def srpo_train_step_sdxl(
     discount = torch.linspace(discount_pos[0], discount_pos[1], timestep_length).to(device)
     discount_inversion = torch.linspace(discount_inv[0], discount_inv[1], timestep_length).to(device)
     
-    # Get batch data
-    latents_shape = batch["latents"].shape
-    batch_size = latents_shape[0]
-    height, width = latents_shape[2] * 8, latents_shape[3] * 8  # VAE scale factor = 8
+    # Determine batch size and resolution
+    if "target_sizes_hw" in batch and batch["target_sizes_hw"] is not None:
+        h0, w0 = batch["target_sizes_hw"][0].tolist()
+        height, width = int(h0), int(w0)
+    elif "original_sizes_hw" in batch and batch["original_sizes_hw"] is not None:
+        h0, w0 = batch["original_sizes_hw"][0].tolist()
+        height, width = int(h0), int(w0)
+    else:
+        height, width = 1024, 1024
+    if "input_ids" in batch and batch["input_ids"] is not None:
+        batch_size = batch["input_ids"].shape[0]
+    elif "latents" in batch and batch["latents"] is not None:
+        batch_size = batch["latents"].shape[0]
+    else:
+        batch_size = 1
     
-    # Get text embeddings
-    encoder_hidden_states1 = batch["text_encoder_outputs1"]
-    encoder_hidden_states2 = batch["text_encoder_outputs2"]
-    pooled_prompt_embeds = batch["text_encoder_pool2"]
+    # Text embeddings (prefer precomputed if provided)
+    encoder_hidden_states1 = precomputed_encoder_hidden_states1 if precomputed_encoder_hidden_states1 is not None else batch.get("text_encoder_outputs1")
+    encoder_hidden_states2 = precomputed_encoder_hidden_states2 if precomputed_encoder_hidden_states2 is not None else batch.get("text_encoder_outputs2")
+    pooled_prompt_embeds = precomputed_pooled_prompt_embeds if precomputed_pooled_prompt_embeds is not None else batch.get("text_encoder_pool2")
     
     # Concatenate hidden states for SDXL
     encoder_hidden_states = torch.cat([encoder_hidden_states1, encoder_hidden_states2], dim=-1)
@@ -193,23 +199,18 @@ def srpo_train_step_sdxl(
         pooled_prompt_embeds = torch.cat([pooled_prompt_embeds] * 2)
         add_time_ids = torch.cat([add_time_ids] * 2)
     
-    # Step 1: Online rollout - generate image from noise
-    latents = torch.randn(
-        (batch_size, 4, height // 8, width // 8),
-        device=device,
-        dtype=weight_dtype,
-    )
-    
+    # Step 1: Online rollout to get x0 sample
+    latents_x0 = torch.randn((batch_size, 4, height // 8, width // 8), device=device, dtype=weight_dtype)
     with torch.no_grad():
-        latents = run_sdxl_sample_step(
+        latents_x0 = run_sdxl_sample_step(
             unet=unet,
             scheduler=scheduler,
-            latents=latents,
+            latents=latents_x0,
             encoder_hidden_states=encoder_hidden_states,
             pooled_prompt_embeds=pooled_prompt_embeds,
             add_time_ids=add_time_ids,
             guidance_scale=guidance_scale,
-            num_inference_steps=50,
+            num_inference_steps=timestep_length,
             device=device,
             weight_dtype=weight_dtype,
         )
@@ -231,114 +232,102 @@ def srpo_train_step_sdxl(
     pos_captions = [f"{pos_control}. {cap}" for cap in captions]
     neg_captions = [f"{neg_control}. {cap}" for cap in captions]
     
-    # Select random timestep for training
+    # Choose timestep within configured range
     import random
-    mid_timestep = random.randint(5, timestep_length - 5)
-    k = int((1 - groundtruth_ratio) * timestep_length) + 1
-    k = min(min(timestep_length - mid_timestep, k), mid_timestep)
-    
-    total_loss = 0.0
-    
-    # Step 2-5: Direct-Align with inversion and denoising branches
-    for i in range(gradient_accumulation_steps):
-        inversion = i % 2
-        
-        # Determine timestep range
-        if inversion == 0:
-            # Denoising branch
-            start_t = max(mid_timestep - k, 1)
-            end_t = mid_timestep
+    lo, hi = int(train_timestep_range[0]), int(train_timestep_range[1])
+    lo = max(1, min(lo, timestep_length - 2))
+    hi = max(lo + 1, min(hi, timestep_length - 1))
+    mid_timestep = random.randint(lo, hi)
+    k = int((1.0 - groundtruth_ratio) * timestep_length) + 1
+    k = max(1, min(min(timestep_length - 1 - mid_timestep, k), mid_timestep))
+
+    # Map SRPO index [0..T-1] to scheduler index [0..num_train_timesteps-1]
+    num_train_t = int(getattr(scheduler.config, 'num_train_timesteps', 1000))
+    def map_idx(i: int) -> int:
+        return int(round(i / float(max(1, timestep_length - 1)) * (num_train_t - 1)))
+
+    discount = torch.linspace(discount_pos[0], discount_pos[1], timestep_length, device=device, dtype=weight_dtype)
+    discount_inversion = torch.linspace(discount_inv[0], discount_inv[1], timestep_length, device=device, dtype=weight_dtype)
+
+    # Captions
+    captions = batch.get("captions", [""] * batch_size)
+    pos_control_words = getattr(args, 'srpo_positive_controls', None)
+    neg_control_words = getattr(args, 'srpo_negative_controls', None)
+    if pos_control_words and len(pos_control_words) > 0:
+        pos_control = pos_control_words[global_step % len(pos_control_words)]
+    else:
+        pos_control = srpo_reward_models.get_random_realism_adjective(global_step)
+    if neg_control_words and len(neg_control_words) > 0:
+        neg_control = neg_control_words[global_step % len(neg_control_words)]
+    else:
+        neg_control = srpo_reward_models.get_random_cg_oily_adjective(global_step)
+    pos_captions = [f"{pos_control}. {cap}" for cap in captions]
+    neg_captions = [f"{neg_control}. {cap}" for cap in captions]
+
+    # Shared noise prior ε
+    eps = torch.randn_like(latents_x0)
+
+    losses = []
+    for branch in ("denoise", "inversion"):
+        if branch == "denoise":
+            start_i = mid_timestep
+            end_i = max(0, mid_timestep - k)
+            k_coeff = discount[mid_timestep]
         else:
-            # Inversion branch  
-            start_t = mid_timestep
-            end_t = min(mid_timestep + k, timestep_length)
-        
-        # Inject noise at intermediate timestep
-        noise = torch.randn_like(latents)
-        timestep_tensor = torch.tensor([start_t], device=device)
-        noisy_latents = scheduler.add_noise(latents, noise, timestep_tensor)
-        
-        # Enable gradients for trainable step
-        noisy_latents = noisy_latents.detach().requires_grad_(True)
-        
-        # Forward pass through UNet (with gradients)
+            start_i = mid_timestep
+            end_i = min(timestep_length - 1, mid_timestep + k)
+            k_coeff = discount_inversion[mid_timestep]
+
+        t_start_idx = map_idx(start_i)
+        t_end_idx = map_idx(end_i)
+        alpha_start, sigma_start = _alpha_sigma_from_scheduler(scheduler, t_start_idx, device, weight_dtype)
+        alpha_end, sigma_end = _alpha_sigma_from_scheduler(scheduler, t_end_idx, device, weight_dtype)
+
+        # Inject noise at t_start: x_t = alpha_start * x0 + sigma_start * eps
+        x_t = alpha_start * latents_x0 + sigma_start * eps
+
+        # Predict noise at t_start
         unet.train()
+        t_tensor = torch.tensor([t_start_idx], device=device, dtype=torch.long)
         noise_pred = unet(
-            noisy_latents,
-            timestep_tensor,
-            encoder_hidden_states=encoder_hidden_states[:batch_size],  # Only use positive prompt
-            added_cond_kwargs={
-                "text_embeds": pooled_prompt_embeds[:batch_size],
-                "time_ids": add_time_ids[:batch_size]
-            },
+            x_t.detach().requires_grad_(True),
+            t_tensor,
+            encoder_hidden_states=encoder_hidden_states[:batch_size],
+            added_cond_kwargs={"text_embeds": pooled_prompt_embeds[:batch_size], "time_ids": add_time_ids[:batch_size]},
             return_dict=False,
         )[0]
-        
-        # Take one diffusion step (inverse or denoise)
-        if inversion == 0:
-            # Denoising: move towards clean image
-            next_timestep = torch.tensor([end_t], device=device)
-            pred_latents = sdxl_euler_step(noise_pred, noisy_latents, timestep_tensor, next_timestep)
-        else:
-            # Inversion: move towards noisy image
-            next_timestep = torch.tensor([end_t], device=device)
-            pred_latents = sdxl_euler_step(-noise_pred, noisy_latents, timestep_tensor, next_timestep)
-        
-        # Check if reward model is enabled
+
+        # One-step move: x_end = x_t + (sigma_end - sigma_start) * noise_pred
+        dsigma = sigma_end - sigma_start
+        x_end = x_t + dsigma * noise_pred
+
+        # Closed-form recovery at t_end
+        x0_hat = (x_end - sigma_end * eps) / torch.clamp(alpha_end, min=1e-6)
+
         use_reward_model = getattr(args, 'srpo_use_reward_model', True) and reward_model is not None
-        
         if use_reward_model:
-            # Decode latents to images for reward computation
             vae.eval()
             with torch.autocast("cuda", dtype=weight_dtype):
-                pred_latents_decode = pred_latents / vae.config.scaling_factor
-                images = vae.decode(pred_latents_decode, return_dict=False)[0]
+                dec_in = x0_hat / vae.config.scaling_factor
+                images = vae.decode(dec_in, return_dict=False)[0]
                 images = (images / 2 + 0.5).clamp(0, 1)
-            
-            # Compute reward
             with torch.amp.autocast('cuda'):
-                if inversion == 1:
-                    # Denoising branch: reward for positive style
-                    rewards = reward_model.srp_cfg(
-                        pos_captions,
-                        neg_captions,
-                        images,
-                        discount[mid_timestep]
-                    )
+                if branch == "denoise":
+                    rewards = reward_model.srp_cfg(pos_captions, neg_captions, images, k_coeff)
                 else:
-                    # Inversion branch: penalize negative style
-                    rewards = reward_model.srp_cfg(
-                        neg_captions,
-                        pos_captions,
-                        images,
-                        discount_inversion[mid_timestep]
-                    )
-            
-            # Compute loss with ReLU threshold (prevents reward hacking)
-            loss = F.relu(-rewards + reward_threshold) / gradient_accumulation_steps
-            loss = loss.mean()
+                    rewards = reward_model.srp_cfg(neg_captions, pos_captions, images, k_coeff)
+            loss_branch = F.relu(-rewards + reward_threshold).mean()
         else:
-            # No reward model: use simple preference loss based on noise prediction quality
-            # Compute MSE between predicted noise and actual noise (denoising objective)
-            # This encourages better denoising without external reward model bias
-            target_latents = latents.detach()  # Use generated latents as target
-            
-            # Apply preference-based weighting: positive branch gets higher weight
-            if inversion == 1:
-                # Denoising branch: higher weight (encourage this path)
-                weight = 1.0 + discount[mid_timestep]
+            # Preference-weighted MSE w.r.t. rollout x0
+            if branch == "denoise":
+                weight = 1.0 + k_coeff
             else:
-                # Inversion branch: lower weight
-                weight = 1.0 - discount_inversion[mid_timestep]
-            
-            # Simple MSE loss weighted by preference
-            loss = F.mse_loss(pred_latents, target_latents, reduction='none')
-            loss = (loss * weight).mean() / gradient_accumulation_steps
-        
-        loss.backward()
-        total_loss += loss.item()
-    
-    return total_loss
+                weight = 1.0 - k_coeff
+            loss_branch = F.mse_loss(x0_hat, latents_x0, reduction='mean') * weight
+
+        losses.append(loss_branch)
+
+    return sum(losses) / len(losses)
 
 
 def should_use_srpo_training(args) -> bool:
