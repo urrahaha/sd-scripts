@@ -56,6 +56,16 @@ class AuroRAModule(LoRAModule):
             with torch.no_grad():
                 self.anl_H.weight.copy_(torch.eye(self.lora_dim))
 
+        self.spline_k = 4
+        self.register_buffer("spline_centers", torch.tensor([-1.0, -0.5, 0.5, 1.0]))
+        self.register_buffer("spline_scale", torch.tensor(1.5))
+        if org_module.__class__.__name__ == "Conv2d":
+            self.spline_ws = torch.nn.Parameter(torch.empty(self.lora_dim, self.spline_k, 1, 1))
+        else:
+            self.spline_ws = torch.nn.Parameter(torch.empty(self.lora_dim, self.spline_k))
+        torch.nn.init.normal_(self.spline_ws, mean=0.0, std=1e-3)
+        self.spline_gate = torch.nn.Parameter(torch.tensor(0.0))
+
     def forward(self, x):
         org_forwarded = self.org_forward(x)
 
@@ -79,12 +89,33 @@ class AuroRAModule(LoRAModule):
         else:
             scale = self.scale
 
-        lx = torch.tanh(lx)
+        lx = torch.tanh(lx) + self.spline_gate * self._spline_aug(lx)
         lx = self.anl_H(lx)
         lx = torch.tanh(lx)
         lx = self.lora_up(lx)
 
         return org_forwarded + lx * self.multiplier * scale
+
+    def _spline_aug(self, z: torch.Tensor) -> torch.Tensor:
+        K = self.spline_k
+        aug = torch.zeros_like(z)
+        for m in range(K):
+            c = self.spline_centers[m]
+            a = self.spline_scale
+            phi = torch.tanh(a * (z - c))
+            if z.ndim == 4:
+                w = self.spline_ws[:, m]
+                if w.ndim > 1:
+                    w = w.squeeze()
+                w = w.view(1, -1, 1, 1)
+            elif z.ndim == 3:
+                w = (self.spline_ws[:, m].squeeze()).view(1, 1, -1)
+            elif z.ndim == 2:
+                w = (self.spline_ws[:, m].squeeze()).view(1, -1)
+            else:
+                w = (self.spline_ws[:, m].squeeze()).view([1] * (z.ndim - 1) + [-1])
+            aug = aug + phi * w
+        return aug
 
 
 class AuroRAInfModule(LoRAInfModule):
@@ -112,9 +143,18 @@ class AuroRAInfModule(LoRAInfModule):
             with torch.no_grad():
                 self.anl_H.weight.copy_(torch.eye(self.lora_dim))
 
+        self.spline_k = 4
+        self.register_buffer("spline_centers", torch.tensor([-1.0, -0.5, 0.5, 1.0]))
+        self.register_buffer("spline_scale", torch.tensor(1.5))
+        if org_module.__class__.__name__ == "Conv2d":
+            self.spline_ws = torch.nn.Parameter(torch.zeros(self.lora_dim, self.spline_k, 1, 1))
+        else:
+            self.spline_ws = torch.nn.Parameter(torch.zeros(self.lora_dim, self.spline_k))
+        self.spline_gate = torch.nn.Parameter(torch.tensor(0.0))
+
     def anl_forward(self, x):
         z = self.lora_down(x)
-        z = torch.tanh(z)
+        z = torch.tanh(z) + self.spline_gate * self._spline_aug(z)
         z = self.anl_H(z)
         z = torch.tanh(z)
         return self.lora_up(z)
@@ -216,15 +256,59 @@ class AuroRAInfModule(LoRAInfModule):
             A = down_weight.to(torch.float).to(device)
             H = self.anl_H.weight.to(torch.float).to(device)
             A1 = torch.tanh(A)
+            beta = self.spline_gate.to(torch.float).to(device)
+            if beta.item() != 0.0:
+                A1 = A1 + beta * self._spline_aug_weight(A)
             A2 = torch.tanh(H @ A1)
             return A2
         else:
             A = down_weight.to(torch.float).to(device)
             H = self.anl_H.weight.squeeze(3).squeeze(2).to(torch.float).to(device)
             A1 = torch.tanh(A)
+            beta = self.spline_gate.to(torch.float).to(device)
+            if beta.item() != 0.0:
+                A1 = A1 + beta * self._spline_aug_weight(A)
             A2 = torch.einsum("or,rihw->oihw", H, A1)
             A2 = torch.tanh(A2)
             return A2
+
+    def _spline_aug(self, z: torch.Tensor) -> torch.Tensor:
+        K = self.spline_k
+        aug = torch.zeros_like(z)
+        for m in range(K):
+            c = self.spline_centers[m]
+            a = self.spline_scale
+            phi = torch.tanh(a * (z - c))
+            if z.ndim == 4:
+                w = self.spline_ws[:, m]
+                if w.ndim > 1:
+                    w = w.squeeze()
+                w = w.view(1, -1, 1, 1)
+            elif z.ndim == 3:
+                w = (self.spline_ws[:, m].squeeze()).view(1, 1, -1)
+            elif z.ndim == 2:
+                w = (self.spline_ws[:, m].squeeze()).view(1, -1)
+            else:
+                w = (self.spline_ws[:, m].squeeze()).view([1] * (z.ndim - 1) + [-1])
+            aug = aug + phi * w
+        return aug
+
+    def _spline_aug_weight(self, A: torch.Tensor) -> torch.Tensor:
+        K = self.spline_k
+        aug = torch.zeros_like(A)
+        for m in range(K):
+            c = self.spline_centers[m]
+            a = self.spline_scale
+            phi = torch.tanh(a * (A - c))
+            w = self.spline_ws[:, m]
+            if w.ndim > 1:
+                w = w.squeeze()
+            if len(A.size()) == 2:
+                wv = w.view(-1, 1)
+            else:
+                wv = w.view(-1, 1, 1, 1)
+            aug = aug + phi * wv
+        return aug
 
     def merge_to(self, sd, dtype, device):
         up_weight = sd["lora_up.weight"].to(torch.float).to(device)

@@ -91,14 +91,94 @@ def merge_to_sd_model(text_encoder, unet, models, ratios, merge_dtype):
                     if len(down_weight.size()) == 2:
                         A = down_weight
                         A1 = torch.tanh(A)
+                        ws_key = key.replace("lora_down.weight", "spline_ws")
+                        gate_key = key.replace("lora_down.weight", "spline_gate")
+                        centers_key = key.replace("lora_down.weight", "spline_centers")
+                        scale_key = key.replace("lora_down.weight", "spline_scale")
+                        if (
+                            ws_key in lora_sd
+                            and gate_key in lora_sd
+                            and centers_key in lora_sd
+                            and scale_key in lora_sd
+                            and float(lora_sd[gate_key]) != 0.0
+                        ):
+                            ws = lora_sd[ws_key]
+                            centers = lora_sd[centers_key]
+                            a = lora_sd[scale_key]
+                            beta = lora_sd[gate_key]
+                            K = centers.shape[0]
+                            aug = 0
+                            for m in range(K):
+                                c = centers[m]
+                                phi = torch.tanh(a * (A - c))
+                                w = ws[:, m]
+                                if w.ndim > 1:
+                                    w = w.squeeze()
+                                wv = w.view(-1, 1)
+                                aug = aug + phi * wv
+                            A1 = A1 + beta * aug
                         A_tilde = torch.tanh(H @ A1)
                     elif down_weight.size()[2:4] == (1, 1):
                         H2 = H.squeeze(3).squeeze(2)
-                        A1 = torch.tanh(down_weight)
+                        A = down_weight
+                        A1 = torch.tanh(A)
+                        ws_key = key.replace("lora_down.weight", "spline_ws")
+                        gate_key = key.replace("lora_down.weight", "spline_gate")
+                        centers_key = key.replace("lora_down.weight", "spline_centers")
+                        scale_key = key.replace("lora_down.weight", "spline_scale")
+                        if (
+                            ws_key in lora_sd
+                            and gate_key in lora_sd
+                            and centers_key in lora_sd
+                            and scale_key in lora_sd
+                            and float(lora_sd[gate_key]) != 0.0
+                        ):
+                            ws = lora_sd[ws_key]
+                            centers = lora_sd[centers_key]
+                            a = lora_sd[scale_key]
+                            beta = lora_sd[gate_key]
+                            K = centers.shape[0]
+                            aug = 0
+                            for m in range(K):
+                                c = centers[m]
+                                phi = torch.tanh(a * (A - c))
+                                w = ws[:, m]
+                                if w.ndim > 1:
+                                    w = w.squeeze()
+                                wv = w.view(-1, 1, 1, 1)
+                                aug = aug + phi * wv
+                            A1 = A1 + beta * aug
                         A_tilde = torch.tanh(torch.einsum("or,rihw->oihw", H2, A1))
                     else:
                         H2 = H.squeeze(3).squeeze(2)
-                        A1 = torch.tanh(down_weight)
+                        A = down_weight
+                        A1 = torch.tanh(A)
+                        ws_key = key.replace("lora_down.weight", "spline_ws")
+                        gate_key = key.replace("lora_down.weight", "spline_gate")
+                        centers_key = key.replace("lora_down.weight", "spline_centers")
+                        scale_key = key.replace("lora_down.weight", "spline_scale")
+                        if (
+                            ws_key in lora_sd
+                            and gate_key in lora_sd
+                            and centers_key in lora_sd
+                            and scale_key in lora_sd
+                            and float(lora_sd[gate_key]) != 0.0
+                        ):
+                            ws = lora_sd[ws_key]
+                            centers = lora_sd[centers_key]
+                            a = lora_sd[scale_key]
+                            beta = lora_sd[gate_key]
+                            K = centers.shape[0]
+                            aug = 0
+                            for m in range(K):
+                                c = centers[m]
+                                phi = torch.tanh(a * (A - c))
+                                w = ws[:, m]
+                                if w.ndim > 1:
+                                    w = w.squeeze()
+                                wv = w.view(-1, 1, 1, 1)
+                                aug = aug + phi * wv
+                            A1 = A1 + beta * aug
                         A_tilde = torch.tanh(torch.einsum("or,rihw->oihw", H2, A1))
                 else:
                     A_tilde = down_weight
