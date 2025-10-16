@@ -1106,8 +1106,9 @@ class SdxlUNet2DConditionModel(nn.Module):
 
         h = call_module(self.middle_block, h, emb, context)
 
-        for module in self.output_blocks:
-            h = torch.cat([h, hs.pop()], dim=1)
+        for idx, module in enumerate(self.output_blocks):
+            skip = hs.pop()
+            h = torch.cat([h, skip], dim=1)
             h = call_module(module, h, emb, context)
 
         h = h.type(x.dtype)

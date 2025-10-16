@@ -245,9 +245,10 @@ def is_synthetic_image(image_path: str) -> bool:
         True if synthetic, False otherwise
     """
     from pathlib import Path
+    import re
     path = Path(image_path)
-    # Check if stem (filename without extension) ends with _synthetic
-    return path.stem.endswith('_synthetic')
+    # Match *_synthetic or *_synthetic_# (numbered variants)
+    return re.match(r".*_synthetic(?:_\d+)?$", path.stem) is not None
 
 
 def count_synthetic_images(directory: Path) -> int:
@@ -345,7 +346,8 @@ def replicate_dataset_structure(
     train_data_dir: str,
     output_dir: str,
     synthetic_percent: float = 100.0,
-    reuse_existing: bool = True,
+    reuse_existing: bool = False,
+    bucket_map: Optional[dict] = None,
 ) -> tuple[str, dict]:
     """
     Replicate the directory structure from original training dataset.
@@ -398,7 +400,43 @@ def replicate_dataset_structure(
     
     # Check if train_data_dir has subdirectories (DreamBooth style)
     subdirs = [d for d in train_path.iterdir() if d.is_dir()]
+    # If synthetic_path is inside train_path, exclude it from source scanning
+    try:
+        if synthetic_path.resolve().is_dir() and synthetic_path.resolve().parent == train_path.resolve():
+            subdirs = [d for d in subdirs if d.resolve() != synthetic_path.resolve()]
+    except Exception:
+        pass
     
+    # Precompute available bucket sizes (from training), if provided
+    available_buckets = []
+    if bucket_map:
+        try:
+            uniq = {
+                (int(v[0]), int(v[1]))
+                for v in bucket_map.values()
+                if isinstance(v, (tuple, list)) and len(v) == 2
+            }
+            available_buckets = list(uniq)
+        except Exception:
+            available_buckets = []
+
+    def pick_bucket_fallback(w: int, h: int) -> tuple[int, int] | None:
+        if not available_buckets:
+            return None
+        import math
+        ar = w / max(h, 1)
+        best = None
+        best_score = 1e9
+        for bw, bh in available_buckets:
+            # enforce no-upscale
+            if bw > w or bh > h:
+                continue
+            score = abs((bw / max(bh, 1)) - ar) + 1e-6 * (w - bw + h - bh)
+            if score < best_score:
+                best_score = score
+                best = (bw, bh)
+        return best
+
     if subdirs:
         # DreamBooth structure: train_data_dir/10_character/image001.png
         logger.info(f"Found {len(subdirs)} subdirectories (DreamBooth structure)")
@@ -444,30 +482,42 @@ def replicate_dataset_structure(
             
             # Build detailed generation plan for this subset
             generation_tasks = []
-            if images_to_generate > 0:
-                # Get list of original images to use as templates
-                for i, img_file in enumerate(image_files):
-                    if i >= images_to_generate:
-                        break
-                    
+            if images_to_generate > 0 and len(image_files) > 0:
+                # Cycle through original images until reaching target count
+                for k in range(images_to_generate):
+                    img_file = image_files[k % len(image_files)]
                     # Get original image info
                     width, height = get_image_dimensions(img_file)
+                    # Default to None; populate from bucket_map if present; fallback to nearest available bucket
+                    bucket_width = bucket_height = None
+                    if bucket_map is not None:
+                        bucket_size = bucket_map.get(str(img_file)) or bucket_map.get(img_file.name)
+                        if bucket_size is not None:
+                            bw, bh = bucket_size
+                            bucket_width = int(bw)
+                            bucket_height = int(bh)
+                        else:
+                            fb = pick_bucket_fallback(width, height)
+                            if fb is not None:
+                                bucket_width, bucket_height = fb
                     caption = get_caption_for_image(img_file)
                     
-                    # Create synthetic filename: img001.png -> img001_synthetic.png
-                    synthetic_name = img_file.stem + "_synthetic" + img_file.suffix
-                    synthetic_path = synthetic_subdir / synthetic_name
-                    
-                    # Check if this synthetic image already exists
-                    if synthetic_path.exists() and reuse_existing:
-                        continue
+                    # Create unique synthetic filename based on original
+                    base_stem = img_file.stem + "_synthetic"
+                    candidate = synthetic_subdir / (base_stem + img_file.suffix)
+                    idx = 1
+                    while candidate.exists() and reuse_existing:
+                        candidate = synthetic_subdir / (f"{base_stem}_{idx}{img_file.suffix}")
+                        idx += 1
                     
                     generation_tasks.append({
                         'original_path': str(img_file),
-                        'synthetic_path': str(synthetic_path),
+                        'synthetic_path': str(candidate),
                         'caption': caption,
                         'width': width,
                         'height': height,
+                        'bucket_width': bucket_width,
+                        'bucket_height': bucket_height,
                     })
             
             # Store generation plan
@@ -483,17 +533,18 @@ def replicate_dataset_structure(
                 'generation_tasks': generation_tasks,
             }
             
-            # Copy captions/metadata structure (not images - will be generated)
-            if not existing_dataset:  # Only copy on first run
-                for img_file in image_files[:1]:  # Just copy structure from first image
-                    # Copy associated caption if exists
-                    caption_file = img_file.with_suffix('.txt')
-                    if caption_file.exists():
-                        # Create a sample caption in synthetic dir
-                        sample_caption = synthetic_subdir / "sample_caption.txt"
-                        shutil.copy(caption_file, sample_caption)
-                        logger.info(f"    Copied caption structure from {caption_file.name}")
-                        break
+            # Copy all captions from original dataset
+            captions_copied = 0
+            for img_file in image_files:
+                caption_file = img_file.with_suffix('.txt')
+                if caption_file.exists():
+                    # Copy caption with same filename to synthetic dir
+                    dest_caption = synthetic_subdir / caption_file.name
+                    if not dest_caption.exists():  # Don't overwrite existing
+                        shutil.copy(caption_file, dest_caption)
+                        captions_copied += 1
+            if captions_copied > 0:
+                logger.info(f"    Copied {captions_copied} caption files")
     
     else:
         # Flat structure: train_data_dir/image001.png
@@ -523,29 +574,43 @@ def replicate_dataset_structure(
         
         # Build detailed generation plan for flat structure
         generation_tasks = []
-        if images_to_generate > 0:
-            for i, img_file in enumerate(image_files):
-                if i >= images_to_generate:
-                    break
+        if images_to_generate > 0 and len(image_files) > 0:
+            for k in range(images_to_generate):
+                img_file = image_files[k % len(image_files)]
                 
                 # Get original image info
                 width, height = get_image_dimensions(img_file)
+                bucket_size = None
+                if bucket_map is not None:
+                    bucket_size = bucket_map.get(str(img_file)) or bucket_map.get(img_file.name)
+                    if bucket_size is not None:
+                        bucket_width, bucket_height = bucket_size
+                    else:
+                        fb = pick_bucket_fallback(width, height)
+                        if fb is not None:
+                            bucket_width, bucket_height = fb
+                        else:
+                            bucket_width = bucket_height = None
+                else:
+                    bucket_width = bucket_height = None
                 caption = get_caption_for_image(img_file)
                 
-                # Create synthetic filename
-                synthetic_name = img_file.stem + "_synthetic" + img_file.suffix
-                synthetic_path_full = synthetic_path / synthetic_name
-                
-                # Check if already exists
-                if synthetic_path_full.exists() and reuse_existing:
-                    continue
+                # Create unique synthetic filename
+                base_stem = img_file.stem + "_synthetic"
+                candidate = synthetic_path / (base_stem + img_file.suffix)
+                idx = 1
+                while candidate.exists() and reuse_existing:
+                    candidate = synthetic_path / (f"{base_stem}_{idx}{img_file.suffix}")
+                    idx += 1
                 
                 generation_tasks.append({
                     'original_path': str(img_file),
-                    'synthetic_path': str(synthetic_path_full),
+                    'synthetic_path': str(candidate),
                     'caption': caption,
                     'width': width,
                     'height': height,
+                    'bucket_width': bucket_width,
+                    'bucket_height': bucket_height,
                 })
         
         # Store generation plan
@@ -561,15 +626,17 @@ def replicate_dataset_structure(
             'generation_tasks': generation_tasks,
         }
         
-        # Copy caption structure
-        if not existing_dataset:  # Only copy on first run
-            for img_file in image_files[:1]:
-                caption_file = img_file.with_suffix('.txt')
-                if caption_file.exists():
-                    sample_caption = synthetic_path / "sample_caption.txt"
-                    shutil.copy(caption_file, sample_caption)
-                    logger.info(f"  Copied caption structure")
-                    break
+        # Copy all captions from original dataset
+        captions_copied = 0
+        for img_file in image_files:
+            caption_file = img_file.with_suffix('.txt')
+            if caption_file.exists():
+                dest_caption = synthetic_path / caption_file.name
+                if not dest_caption.exists():  # Don't overwrite existing
+                    shutil.copy(caption_file, dest_caption)
+                    captions_copied += 1
+        if captions_copied > 0:
+            logger.info(f"  Copied {captions_copied} caption files")
     
     logger.info("")
     logger.info("=" * 60)
@@ -598,6 +665,7 @@ def generate_synthetic_dataset(
     weight_dtype=None,
     device=None,
     test_mode: bool = False,
+    bucket_map: Optional[dict] = None,
 ) -> tuple[str, dict]:
     """
     Generate synthetic dataset by replicating original structure and generating images.
@@ -651,7 +719,8 @@ def generate_synthetic_dataset(
         train_data_dir=train_data_dir,
         output_dir=synthetic_dir,
         synthetic_percent=synthetic_percent,
-        reuse_existing=True,
+        reuse_existing=False,
+        bucket_map=bucket_map,
     )
     
     # Check if there are any images to generate
@@ -685,8 +754,8 @@ def generate_synthetic_dataset(
         from .neon_generation_pipeline import generate_synthetic_images
         
         # Get generation parameters from args
-        guidance_scale = getattr(args, 'neon_guidance_scale', 7.5)
-        num_inference_steps = getattr(args, 'neon_inference_steps', 28)
+        guidance_scale = getattr(args, 'neon_guidance_scale', 6)
+        num_inference_steps = getattr(args, 'neon_inference_steps', 20)
         seed = getattr(args, 'seed', None)
         
         num_generated = generate_synthetic_images(
@@ -701,6 +770,11 @@ def generate_synthetic_dataset(
             guidance_scale=guidance_scale,
             num_inference_steps=num_inference_steps,
             seed=seed,
+            clip_skip=getattr(args, 'clip_skip', None),
+            comfy_mode=True,
+            positive_prefix=getattr(args, 'neon_positive_prefix', ''),
+            negative_prompt=getattr(args, 'neon_negative_prompt', None),
+            generation_batch_size=int(getattr(args, 'neon_generation_batch_size', 1) or 1),
         )
         
         logger.info(f"✅ Successfully generated {num_generated} synthetic images")

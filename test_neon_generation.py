@@ -38,8 +38,8 @@ class Args:
         self.seed = seed
         self.neon_enable = True
         self.neon_synthetic_dataset_dir = None
-        self.neon_guidance_scale = 7.5
-        self.neon_inference_steps = 28
+        self.neon_guidance_scale = 6
+        self.neon_inference_steps = 20
 
 
 def test_structure_and_plan(train_dir: str, output_dir: str, percent: float = 100.0):

@@ -23,7 +23,7 @@ init_ipex()
 
 from accelerate.utils import set_seed
 from accelerate import Accelerator
-from diffusers import DDPMScheduler
+from diffusers import DDPMScheduler, EulerAncestralDiscreteScheduler
 from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
 from library import deepspeed_utils, model_util, sai_model_spec, strategy_base, strategy_sd, sai_model_spec
 try:
@@ -1287,12 +1287,46 @@ class NetworkTrainer:
         global_step = 0
 
         noise_scheduler = self.get_noise_scheduler(args, accelerator.device)
+        generation_noise_scheduler = EulerAncestralDiscreteScheduler.from_config(noise_scheduler.config)
 
         train_util.init_trackers(accelerator, args, args.output_name or "network_train")
 
         loss_recorder = train_util.LossRecorder()
         val_step_loss_recorder = train_util.LossRecorder()
         val_epoch_loss_recorder = train_util.LossRecorder()
+
+        # Pre-collect per-image bucket assignments for Neon before dataset deletion
+        neon_bucket_map = {}
+        try:
+            ds_group = locals().get("train_dataset_group")
+            if ds_group is not None:
+                for dataset in getattr(ds_group, "datasets", []):
+                    image_data = getattr(dataset, "image_data", None)
+                    if not isinstance(image_data, dict):
+                        continue
+                    for info in image_data.values():
+                        reso = getattr(info, "bucket_reso", None)
+                        if reso and all(reso):
+                            try:
+                                w, h = int(reso[0]), int(reso[1])
+                            except Exception:
+                                continue
+                            abs_path = getattr(info, "absolute_path", None)
+                            if abs_path:
+                                neon_bucket_map[abs_path] = (w, h)
+                                bname = os.path.basename(abs_path)
+                                if bname:
+                                    neon_bucket_map[bname] = (w, h)
+                            img_key = getattr(info, "image_key", None)
+                            if img_key:
+                                neon_bucket_map[img_key] = (w, h)
+            if neon_bucket_map:
+                logger.info(
+                    "Neon: pre-collected %s per-image bucket assignments before dataset deletion",
+                    len(neon_bucket_map),
+                )
+        except Exception as e:
+            logger.debug("Neon: pre-collection of bucket_map failed: %s", e)
 
         del train_dataset_group
         if val_dataset_group is not None:
@@ -1329,8 +1363,8 @@ class NetworkTrainer:
                 os.remove(old_ckpt_file)
 
         # if text_encoder is not needed for training, delete it to save memory.
-        # TODO this can be automated after SDXL sample prompt cache is implemented
-        if self.is_text_encoder_not_needed_for_training(args):
+        # Keep text encoders if Neon is enabled (needed for synthetic generation/post-training)
+        if self.is_text_encoder_not_needed_for_training(args) and not getattr(args, "neon_enable", False):
             logger.info("text_encoder is not needed for training. deleting to save memory.")
             for t_enc in text_encoders:
                 del t_enc
@@ -1410,6 +1444,18 @@ class NetworkTrainer:
                     torch.cuda.set_rng_state(gpu_rng_state)
             random.setstate(python_rng_state)
 
+        # Skip main training if Neon-only post-training mode
+        if args.neon_only_post_train and args.neon_enable:
+            logger.info("")
+            logger.info("=" * 60)
+            logger.info("Neon-Only Post-Training Mode")
+            logger.info("Skipping normal training, will use existing LoRA")
+            logger.info("=" * 60)
+            logger.info("")
+            
+            # Set num_train_epochs to 0 to skip the training loop
+            num_train_epochs = 0
+        
         for epoch in range(epoch_to_start, num_train_epochs):
             accelerator.print(f"\nepoch {epoch+1}/{num_train_epochs}\n")
             current_epoch.value = epoch + 1
@@ -1739,6 +1785,265 @@ class NetworkTrainer:
             save_model(ckpt_name, network, global_step, num_train_epochs, force_sync_upload=True)
 
             logger.info("model saved.")
+            
+            # Neon post-training phase
+            if args.neon_enable:
+                logger.info("")
+                logger.info("=" * 60)
+                logger.info("Starting Neon Post-Training Phase")
+                logger.info("=" * 60)
+                
+                try:
+                    from library.neon_train_utils import generate_synthetic_dataset
+                    from library.neon_post_training import create_synthetic_dataloader, run_post_training_loop
+                    from library.neon_merge import neon_merge
+                    from pathlib import Path
+                    
+                    # Get train data directory
+                    train_data_dir = None
+                    if args.train_data_dir:
+                        train_data_dir = args.train_data_dir
+                    elif hasattr(train_dataset_group, 'datasets') and len(train_dataset_group.datasets) > 0:
+                        first_dataset = train_dataset_group.datasets[0]
+                        if hasattr(first_dataset, 'img_folder'):
+                            train_data_dir = first_dataset.img_folder
+                    
+                    if not train_data_dir:
+                        logger.error("Could not determine training data directory for Neon")
+                        logger.error("Please specify --train_data_dir explicitly")
+                    else:
+                        # Prepare tokenizer(s) for Neon phases
+                        if isinstance(tokenizers, list):
+                            if len(tokenizers) == 1:
+                                neon_tokenizer = tokenizers[0]
+                            else:
+                                neon_tokenizer = tuple(tokenizers)
+                        else:
+                            neon_tokenizer = tokenizers
+
+                        # Collect bucket resolutions for Neon synthetic generation
+                        bucket_map = dict(neon_bucket_map) if 'neon_bucket_map' in locals() and neon_bucket_map else {}
+                        if bucket_map:
+                            logger.info("Neon: starting with %s pre-collected bucket assignments", len(bucket_map))
+                        dataset_group_ref = locals().get("train_dataset_group")
+                        if dataset_group_ref is None:
+                            logger.info("Neon: train_dataset_group is None at bucket collection time (post-training-only can cause this).")
+                        else:
+                            try:
+                                logger.info(
+                                    "Neon: train_dataset_group present with %s dataset(s)",
+                                    len(getattr(dataset_group_ref, "datasets", []) ),
+                                )
+                            except Exception:
+                                logger.info("Neon: train_dataset_group present with unknown dataset count")
+                        if dataset_group_ref is not None:
+                            for dataset in getattr(dataset_group_ref, "datasets", []):
+                                image_data = getattr(dataset, "image_data", None)
+                                if not isinstance(image_data, dict):
+                                    logger.info("Neon: dataset %s has no image_data dict (type=%s)", getattr(dataset, 'name', type(dataset).__name__), type(image_data).__name__ if image_data is not None else None)
+                                    continue
+                                logger.debug("Neon: dataset %s image_data count=%s", getattr(dataset, 'name', type(dataset).__name__), len(image_data))
+                                for info in image_data.values():
+                                    reso = getattr(info, "bucket_reso", None)
+                                    if reso and all(reso):
+                                        try:
+                                            w, h = int(reso[0]), int(reso[1])
+                                        except Exception:
+                                            continue
+                                        abs_path = getattr(info, "absolute_path", None)
+                                        if abs_path:
+                                            bucket_map[abs_path] = (w, h)
+                                            bname = os.path.basename(abs_path)
+                                            if bname:
+                                                bucket_map[bname] = (w, h)
+                                        img_key = getattr(info, "image_key", None)
+                                        if img_key:
+                                            bucket_map[img_key] = (w, h)
+
+                        # Logging: totals and unique buckets
+                        total_images_seen = 0
+                        unique_buckets = set()
+                        bucket_hits = 0
+                        if dataset_group_ref is not None:
+                            for dataset in getattr(dataset_group_ref, "datasets", []):
+                                image_data = getattr(dataset, "image_data", None)
+                                if isinstance(image_data, dict):
+                                    total_images_seen += len(image_data)
+                                    for info in image_data.values():
+                                        reso = getattr(info, "bucket_reso", None)
+                                        if reso and all(reso):
+                                            bucket_hits += 1
+                                            try:
+                                                unique_buckets.add((int(reso[0]), int(reso[1])))
+                                            except Exception:
+                                                pass
+
+                        if bucket_map:
+                            logger.info(
+                                "Neon: collected %s per-image bucket assignments (of ~%s images)",
+                                len(bucket_map), total_images_seen or "?",
+                            )
+                            logger.info("Neon: unique bucket resolutions: %s", len(unique_buckets))
+                            logger.debug("Neon: sample buckets: %s", list(unique_buckets)[:8])
+                        else:
+                            logger.warning(
+                                "Neon: bucket_map is empty (images seen=%s). If using SRPO or fixed-resolution training, per-image buckets may be unavailable.",
+                                total_images_seen or "?",
+                            )
+                            # Build a fallback bucket catalog from args to enable bucketed generation
+                            try:
+                                min_reso = int(getattr(args, 'min_bucket_reso', 256))
+                                max_reso = int(getattr(args, 'max_bucket_reso', 2048))
+                                step = int(getattr(args, 'bucket_reso_steps', 64))
+                                # Ensure multiples of 8
+                                if step % 8 != 0:
+                                    step = ((step + 7) // 8) * 8
+                                min_reso = max(64, (min_reso // 8) * 8)
+                                max_reso = max(min_reso, (max_reso // 8) * 8)
+                                fallback_pairs = []
+                                for w in range(min_reso, max_reso + 1, step):
+                                    for h in range(min_reso, max_reso + 1, step):
+                                        fallback_pairs.append((w, h))
+                                # Deduplicate and cap sample logging
+                                fallback_pairs = sorted(set(fallback_pairs))
+                                if fallback_pairs:
+                                    bucket_map = {f"__fallback_{i}": pair for i, pair in enumerate(fallback_pairs)}
+                                    logger.info(
+                                        "Neon: using fallback bucket catalog from args: min=%s max=%s step=%s -> %s pairs",
+                                        min_reso, max_reso, step, len(fallback_pairs)
+                                    )
+                                    logger.debug("Neon: fallback bucket samples: %s", fallback_pairs[:12])
+                                else:
+                                    logger.warning("Neon: could not build fallback bucket catalog (empty set)")
+                            except Exception as e:
+                                logger.warning("Neon: failed to build fallback bucket catalog: %s", e)
+
+                        if bucket_map:
+                            logger.info(
+                                "Neon: passing %s bucket assignments to synthetic generator",
+                                len(bucket_map),
+                            )
+
+                        # Step 1: Generate synthetic dataset
+                        logger.info("Step 1/3: Generating synthetic dataset...")
+                        
+                        # Get full path to saved model
+                        output_dir = Path(args.output_dir) if hasattr(args, 'output_dir') and args.output_dir else Path(".")
+                        base_model_path = output_dir / ckpt_name
+                        
+                        # Verify the model file exists
+                        if not base_model_path.exists():
+                            # Try without output_dir (maybe ckpt_name is already full path)
+                            base_model_path = Path(ckpt_name)
+                            if not base_model_path.exists():
+                                logger.error(f"Cannot find saved model at: {ckpt_name}")
+                                logger.error("Neon post-training requires the base model file")
+                                raise FileNotFoundError(f"Model file not found: {ckpt_name}")
+                        
+                        logger.info(f"Base model path: {base_model_path}")
+                        
+                        # Save pre-Neon model if requested
+                        if args.neon_save_pre_post:
+                            pre_neon_path = str(base_model_path).replace("." + args.save_model_as, "_neon_pre." + args.save_model_as)
+                            import shutil
+                            shutil.copy(str(base_model_path), pre_neon_path)
+                            logger.info(f"Saved pre-Neon model: {pre_neon_path}")
+                        
+                        # Generate synthetic images
+                        synthetic_path, generation_plan = generate_synthetic_dataset(
+                            args=args,
+                            train_data_dir=train_data_dir,
+                            synthetic_percent=args.neon_synthetic_image_percent,
+                            vae=vae,
+                            text_encoder=text_encoder,
+                            unet=unet,
+                            tokenizer=neon_tokenizer,
+                            noise_scheduler=generation_noise_scheduler,
+                            weight_dtype=weight_dtype,
+                            device=accelerator.device,
+                            test_mode=False,
+                            bucket_map=bucket_map if bucket_map else None,
+                        )
+                        
+                        logger.info(f"✓ Synthetic dataset created at: {synthetic_path}")
+                        
+                        # Step 2: Post-training on synthetic data
+                        logger.info("")
+                        logger.info("Step 2/3: Post-training on synthetic dataset...")
+                        logger.info("  (This creates the auxiliary model)")
+                        
+                        # Create dataloader for synthetic dataset
+                        synthetic_dataloader = create_synthetic_dataloader(
+                            synthetic_dataset_path=synthetic_path,
+                            batch_size=args.train_batch_size,
+                            tokenizers=neon_tokenizer,
+                            vae=vae,
+                            resolution=args.resolution if hasattr(args, 'resolution') else 1024,
+                            accelerator=accelerator,
+                        )
+                        
+                        # Run post-training loop
+                        network = run_post_training_loop(
+                            args=args,
+                            accelerator=accelerator,
+                            network=network,
+                            optimizer=optimizer,
+                            train_dataloader=synthetic_dataloader,
+                            lr_scheduler=lr_scheduler,
+                            num_steps=args.neon_post_training_steps if args.neon_post_training_epochs == 0 else 0,
+                            num_epochs=args.neon_post_training_epochs,
+                            vae=vae,
+                            text_encoder=text_encoder,
+                            unet=unet,
+                            noise_scheduler=noise_scheduler,
+                            weight_dtype=weight_dtype,
+                            global_step=global_step,
+                        )
+                        
+                        # Save auxiliary model
+                        aux_model_filename = ckpt_name.replace("." + args.save_model_as, "_neon_aux." + args.save_model_as)
+                        save_model(aux_model_filename, network, global_step, num_train_epochs)
+                        
+                        # Get full path to auxiliary model
+                        aux_model_path = output_dir / aux_model_filename
+                        if not aux_model_path.exists():
+                            aux_model_path = Path(aux_model_filename)
+                        
+                        logger.info(f"✓ Auxiliary model saved: {aux_model_path}")
+                        
+                        # Step 3: Neon merge
+                        logger.info("")
+                        logger.info("Step 3/3: Applying Neon merge...")
+                        
+                        # Apply Neon merge
+                        neon_model_filename = ckpt_name.replace("." + args.save_model_as, "_neon." + args.save_model_as)
+                        neon_model_path = output_dir / neon_model_filename
+                        if str(neon_model_path) == str(output_dir):
+                            # ckpt_name might already have path
+                            neon_model_path = Path(neon_model_filename)
+                        
+                        neon_merge(
+                            base_model_path=str(base_model_path),
+                            aux_model_path=str(aux_model_path),
+                            output_path=str(neon_model_path),
+                            extrapolation_weight=args.neon_extrapolation_weight,
+                            save_format=args.save_model_as,
+                        )
+                        
+                        logger.info(f"✓ Neon-merged model saved: {neon_model_path}")
+                        
+                        logger.info("")
+                        logger.info("=" * 60)
+                        logger.info("✅ Neon Post-Training Phase Complete!")
+                        logger.info("=" * 60)
+                        logger.info(f"Final Neon model: {neon_model_path}")
+                        logger.info("")
+                        
+                except Exception as e:
+                    logger.error(f"Neon post-training failed: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    logger.error("Continuing without Neon post-training...")
 
 
 def setup_parser() -> argparse.ArgumentParser:
@@ -2035,14 +2340,19 @@ def setup_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--neon_guidance_scale",
         type=float,
-        default=7.5,
-        help="Guidance scale for synthetic image generation (default: 7.5) / 合成画像生成のガイダンススケール（デフォルト: 7.5）",
+        default=6,
+        help="Guidance scale for synthetic image generation (default: 6) / 合成画像生成のガイダンススケール（デフォルト: 6）",
     )
     parser.add_argument(
         "--neon_inference_steps",
         type=int,
-        default=28,
-        help="Number of inference steps for synthetic image generation (default: 28) / 合成画像生成の推論ステップ数（デフォルト: 28）",
+        default=20,
+        help="Number of inference steps for synthetic image generation (default: 20) / 合成画像生成の推論ステップ数（デフォルト: 20",
+    )
+    parser.add_argument(
+        "--neon_only_post_train",
+        action="store_true",
+        help="Skip normal training and only do Neon post-training with existing LoRA (requires --network_weights) / 通常トレーニングをスキップし、既存のLoRAでNeonポストトレーニングのみ実行（--network_weights必須）",
     )
     
     return parser
