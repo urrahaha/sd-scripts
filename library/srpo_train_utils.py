@@ -14,6 +14,7 @@ from tqdm import tqdm
 import logging
 
 from . import srpo_reward_models
+from . import sdxl_train_util
 
 logger = logging.getLogger(__name__)
 
@@ -93,20 +94,22 @@ def run_sdxl_sample_step(
     scheduler.set_timesteps(num_inference_steps, device=device)
     timesteps = scheduler.timesteps[start_step:end_step]
     
+    encoder_hidden_states = encoder_hidden_states.to(device=device, dtype=weight_dtype)
+    pooled_prompt_embeds = pooled_prompt_embeds.to(device=device, dtype=weight_dtype)
+    add_time_ids = add_time_ids.to(device=device, dtype=weight_dtype)
+    vector_embedding = torch.cat([pooled_prompt_embeds, add_time_ids], dim=-1)
+
     for i, t in enumerate(timesteps):
         # Expand latents for classifier-free guidance
         latent_model_input = torch.cat([latents] * 2) if guidance_scale > 1.0 else latents
-        
+
         # Predict noise
         with torch.no_grad():
             noise_pred = unet(
                 latent_model_input,
                 t,
                 encoder_hidden_states=encoder_hidden_states,
-                added_cond_kwargs={
-                    "text_embeds": pooled_prompt_embeds,
-                    "time_ids": add_time_ids
-                },
+                y=vector_embedding,
                 return_dict=False,
             )[0]
         
@@ -185,13 +188,42 @@ def srpo_train_step_sdxl(
     
     # Get add_time_ids for SDXL
     add_time_ids = batch.get("add_time_ids")
+
+    # Ensure ADM vector matches SDXL expectations (1536 dims from size embeddings)
+    if add_time_ids is not None and add_time_ids.shape[-1] != 1536:
+        add_time_ids = None
+
     if add_time_ids is None:
-        # Create default add_time_ids if not in batch
-        original_size = (height, width)
-        target_size = (height, width)
-        crops_coords_top_left = (0, 0)
-        add_time_ids = torch.tensor([original_size + crops_coords_top_left + target_size]).to(device, dtype=weight_dtype)
-        add_time_ids = add_time_ids.repeat(batch_size, 1)
+        # Build size embeddings from batch metadata to obtain the 1536-dim vector
+        orig_size = batch.get("original_sizes_hw")
+        crop_size = batch.get("crop_top_lefts")
+        target_size = batch.get("target_sizes_hw")
+
+        if orig_size is None:
+            orig_size = torch.tensor([[height, width]], device=device, dtype=torch.float32)
+        else:
+            orig_size = orig_size.to(device=device, dtype=torch.float32)
+
+        if crop_size is None:
+            crop_size = torch.zeros((batch_size, 2), device=device, dtype=torch.float32)
+        else:
+            crop_size = crop_size.to(device=device, dtype=torch.float32)
+
+        if target_size is None:
+            target_size = torch.tensor([[height, width]], device=device, dtype=torch.float32)
+        else:
+            target_size = target_size.to(device=device, dtype=torch.float32)
+
+        if orig_size.shape[0] != batch_size:
+            orig_size = orig_size.repeat(batch_size, 1)
+        if crop_size.shape[0] != batch_size:
+            crop_size = crop_size.repeat(batch_size, 1)
+        if target_size.shape[0] != batch_size:
+            target_size = target_size.repeat(batch_size, 1)
+
+        add_time_ids = sdxl_train_util.get_size_embeddings(orig_size, crop_size, target_size, device=device)
+
+    add_time_ids = add_time_ids.to(device=device, dtype=weight_dtype)
     
     # Expand for CFG if needed
     if guidance_scale > 1.0:
@@ -289,13 +321,30 @@ def srpo_train_step_sdxl(
         # Predict noise at t_start
         unet.train()
         t_tensor = torch.tensor([t_start_idx], device=device, dtype=torch.long)
+        encoder_hidden_states_local = encoder_hidden_states[:batch_size].to(device=device, dtype=weight_dtype)
+        pooled_prompt_embeds_local = pooled_prompt_embeds[:batch_size].to(device=device, dtype=weight_dtype)
+        add_time_ids_local = add_time_ids[:batch_size].to(device=device, dtype=weight_dtype)
+        vector_embedding_local = torch.cat([pooled_prompt_embeds_local, add_time_ids_local], dim=-1)
         noise_pred = unet(
             x_t.detach().requires_grad_(True),
             t_tensor,
-            encoder_hidden_states=encoder_hidden_states[:batch_size],
-            added_cond_kwargs={"text_embeds": pooled_prompt_embeds[:batch_size], "time_ids": add_time_ids[:batch_size]},
+            encoder_hidden_states=encoder_hidden_states_local,
+            y=vector_embedding_local,
             return_dict=False,
         )[0]
+
+        # If requested, convert Diff2Flow-style v-parameterized output to epsilon using scheduler alphas
+        # This aligns the single-step update with diffusion semantics when UNet outputs v.
+        if getattr(args, 'srpo_use_diff2flow', False):
+            # Determine parameterization from args override or scheduler config
+            d2f_param = getattr(args, 'srpo_d2f_param', None)
+            pred_type = getattr(getattr(scheduler, 'config', object()), 'prediction_type', 'epsilon')
+            # Heuristic: prefer explicit arg; else infer from scheduler config
+            use_v = (d2f_param == 'v') or (d2f_param is None and isinstance(pred_type, str) and pred_type.lower().startswith('v'))
+            if use_v:
+                # Convert v -> eps: eps = sqrt(alpha_cum) * v + sqrt(1 - alpha_cum) * x_t
+                # alpha_start is sqrt(alpha_cum), sigma_start is sqrt(1 - alpha_cum)
+                noise_pred = (alpha_start * noise_pred) + (sigma_start * x_t)
 
         # One-step move: x_end = x_t + (sigma_end - sigma_start) * noise_pred
         dsigma = sigma_end - sigma_start

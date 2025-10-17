@@ -458,7 +458,7 @@ def replicate_dataset_structure(
                          list(subdir.glob("*.jpeg")) + list(subdir.glob("*.webp"))
             
             original_count = len(image_files)
-            synthetic_target = max(1, int(original_count * num_repeats * (synthetic_percent / 100.0)))
+            synthetic_target = max(1, int(original_count * (synthetic_percent / 100.0)))
             
             # Create synthetic subdirectory with same naming
             synthetic_subdir = synthetic_path / subdir.name
@@ -470,7 +470,7 @@ def replicate_dataset_structure(
             
             logger.info(f"  {subdir.name}:")
             logger.info(f"    Original: {original_count} images (×{num_repeats} repeats)")
-            logger.info(f"    Target: {synthetic_target} synthetic images")
+            logger.info(f"    Target: {synthetic_target} synthetic images (unique per original)")
             if existing_count > 0:
                 logger.info(f"    Existing: {existing_count} images with '_synthetic' suffix ✓")
                 logger.info(f"    To generate: {images_to_generate} more synthetic images")

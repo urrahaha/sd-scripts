@@ -4,9 +4,13 @@ Neon Post-Training Loop
 Runs additional training on synthetic dataset to create auxiliary model.
 """
 
+import math
 import torch
 from pathlib import Path
 import logging
+import os
+from library.device_utils import clean_memory_on_device
+from library import train_util, sdxl_train_util
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +57,46 @@ def run_post_training_loop(
     """
     from tqdm import tqdm
     
+    # Memory strategy
+    logger.info("Preparing models for post-training (optimizing memory)...")
+    device = accelerator.device
+    use_low_vram = bool(getattr(args, "lowram", False) or getattr(args, "neon_low_vram", False))
+
+    # Save original device placements
+    unet_device = unet.device
+    text_encoder_devices = []
+    if isinstance(text_encoder, (list, tuple)):
+        for te in text_encoder:
+            text_encoder_devices.append(te.device)
+    else:
+        text_encoder_devices.append(text_encoder.device)
+
+    # Place models based on memory mode
+    if use_low_vram:
+        # Low-VRAM path: keep UNet/Text Encoders on CPU until needed, VAE on GPU for encoding
+        if isinstance(text_encoder, (list, tuple)):
+            for te in text_encoder:
+                te.to("cpu")
+        else:
+            text_encoder.to("cpu")
+        unet.to("cpu")
+        clean_memory_on_device(device)
+
+        vae.requires_grad_(False)
+        vae.eval()
+        vae.to(device, dtype=vae.dtype)
+    else:
+        # High-VRAM path: keep everything on device to avoid costly shuffles
+        vae.requires_grad_(False)
+        vae.eval()
+        vae.to(device, dtype=vae.dtype)
+        if isinstance(text_encoder, (list, tuple)):
+            for te in text_encoder:
+                te.to(device)
+        else:
+            text_encoder.to(device)
+        unet.to(device)
+    
     network.train()
     
     # Determine training length
@@ -73,6 +117,9 @@ def run_post_training_loop(
     
     current_step = 0
     
+    dataset_obj = getattr(train_dataloader, "dataset", None)
+    dataset_tokenizers = getattr(dataset_obj, "tokenizers", None)
+
     for epoch in range(epochs_to_train):
         for batch in train_dataloader:
             if num_steps > 0 and current_step >= num_steps:
@@ -83,39 +130,107 @@ def run_post_training_loop(
                 # This is a simplified version - adapt based on your actual training loop
                 
                 # Get pixel values and convert to latents
-                pixel_values = batch["pixel_values"].to(accelerator.device, dtype=vae.dtype)
+                pixel_values = batch["pixel_values"].to(device, dtype=vae.dtype, non_blocking=True)
                 if pixel_values.ndim == 3:
                     pixel_values = pixel_values.unsqueeze(0)
                 # already normalized to [-1,1] by transform
 
+                # Process VAE encoding in smaller batches to save memory
+                vae_batch_size = getattr(args, 'vae_batch_size', 1) or 1  # Default to 1 for safety
                 with torch.no_grad():
-                    latents = vae.encode(pixel_values).latent_dist.sample()
+                    if pixel_values.shape[0] <= vae_batch_size:
+                        latents = vae.encode(pixel_values).latent_dist.sample()
+                    else:
+                        # Process in chunks
+                        latent_chunks = []
+                        for i in range(0, pixel_values.shape[0], vae_batch_size):
+                            chunk = pixel_values[i:i + vae_batch_size]
+                            latent_chunk = vae.encode(chunk).latent_dist.sample()
+                            latent_chunks.append(latent_chunk)
+                        latents = torch.cat(latent_chunks, dim=0)
+                    
                     latents = latents * (vae.config.scaling_factor if hasattr(vae.config, "scaling_factor") else 0.18215)
 
                 latents = latents.to(dtype=weight_dtype)
                 
+                # In low-VRAM mode, move VAE off and bring UNet/Text Encoders in for the step
+                if use_low_vram:
+                    vae.to("cpu")
+                    clean_memory_on_device(device)
+
+                    if isinstance(text_encoder, (list, tuple)):
+                        for te in text_encoder:
+                            te.to(device)
+                    else:
+                        text_encoder.to(device)
+                    unet.to(device)
+                    unet.train()
+                    network.train()
+                    if hasattr(optimizer, "train"):
+                        optimizer.train()
+                
+                vector_embeddings = None
+
                 # Encode text (apply optional clip_skip to match training strategy)
                 clip_skip = getattr(args, 'clip_skip', None)
                 if isinstance(text_encoder, (list, tuple)):
-                    hs = []
-                    for i, encoder in enumerate(text_encoder):
-                        input_ids = batch[f"input_ids_{i}"].to(accelerator.device)
-                        if clip_skip is None:
-                            out = encoder(input_ids)[0]
-                        else:
-                            out_dict = encoder(input_ids, output_hidden_states=True, return_dict=True)
-                            idx = -clip_skip if clip_skip and clip_skip > 0 else -2
-                            out = out_dict["hidden_states"][idx]
-                            try:
-                                tm = getattr(encoder, "text_model", None)
-                                if tm is not None and hasattr(tm, "final_layer_norm"):
-                                    out = tm.final_layer_norm(out)
-                            except Exception:
-                                pass
-                        hs.append(out)
-                    encoder_hidden_states = torch.cat(hs, dim=-1)
+                    if len(text_encoder) == 2 and dataset_tokenizers is not None:
+                        input_ids0 = batch["input_ids_0"].to(accelerator.device, non_blocking=True)
+                        input_ids1 = batch["input_ids_1"].to(accelerator.device, non_blocking=True)
+                        max_token_length = getattr(args, "max_token_length", None)
+                        with torch.no_grad():
+                            hidden_states1, hidden_states2, pool2 = train_util.get_hidden_states_sdxl(
+                                max_token_length,
+                                input_ids0,
+                                input_ids1,
+                                dataset_tokenizers[0],
+                                dataset_tokenizers[1],
+                                text_encoder[0],
+                                text_encoder[1],
+                                weight_dtype if getattr(args, "full_fp16", False) else None,
+                                accelerator=accelerator,
+                            )
+
+                        encoder_hidden_states = torch.cat([hidden_states1, hidden_states2], dim=-1)
+
+                        bsz = encoder_hidden_states.shape[0]
+                        height, width = pixel_values.shape[-2], pixel_values.shape[-1]
+                        orig_size = torch.tensor([height, width], device=accelerator.device, dtype=torch.int64).repeat(bsz, 1)
+                        crop_size = torch.zeros_like(orig_size)
+                        target_size = orig_size.clone()
+                        size_embeddings = sdxl_train_util.get_size_embeddings(
+                            orig_size,
+                            crop_size,
+                            target_size,
+                            accelerator.device,
+                        ).to(weight_dtype)
+
+                        pool2 = pool2.to(accelerator.device, dtype=weight_dtype)
+                        if pool2.shape[0] != bsz:
+                            repeat_factor = (bsz + pool2.shape[0] - 1) // pool2.shape[0]
+                            pool2 = pool2.repeat_interleave(repeat_factor, dim=0)[:bsz]
+
+                        vector_embeddings = torch.cat([pool2, size_embeddings], dim=1)
+                    else:
+                        hs = []
+                        for i, encoder in enumerate(text_encoder):
+                            input_ids = batch[f"input_ids_{i}"].to(accelerator.device, non_blocking=True)
+                            if clip_skip is None:
+                                out = encoder(input_ids)[0]
+                            else:
+                                out_dict = encoder(input_ids, output_hidden_states=True, return_dict=True)
+                                idx = -clip_skip if clip_skip and clip_skip > 0 else -2
+                                out = out_dict["hidden_states"][idx]
+                                try:
+                                    tm = getattr(encoder, "text_model", None)
+                                    if tm is not None and hasattr(tm, "final_layer_norm"):
+                                        out = tm.final_layer_norm(out)
+                                except Exception:
+                                    pass
+                            hs.append(out)
+                        encoder_hidden_states = torch.cat(hs, dim=-1)
                 else:
-                    input_ids = batch["input_ids"].to(accelerator.device)
+                    input_ids = batch["input_ids"].to(accelerator.device, non_blocking=True)
                     if clip_skip is None:
                         encoder_hidden_states = text_encoder(input_ids)[0]
                     else:
@@ -128,7 +243,7 @@ def run_post_training_loop(
                                 encoder_hidden_states = tm.final_layer_norm(encoder_hidden_states)
                         except Exception:
                             pass
-                
+
                 # Sample noise
                 noise = torch.randn_like(latents)
                 
@@ -145,12 +260,23 @@ def run_post_training_loop(
                 # Add noise to latents
                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
                 
-                # Predict noise
-                noise_pred = unet(
-                    noisy_latents,
-                    timesteps,
-                    encoder_hidden_states,
-                ).sample
+                # Predict noise (mixed precision)
+                with accelerator.autocast():
+                    if vector_embeddings is not None:
+                        noise_pred_out = unet(
+                            noisy_latents,
+                            timesteps,
+                            encoder_hidden_states,
+                            vector_embeddings,
+                        )
+                    else:
+                        noise_pred_out = unet(
+                            noisy_latents,
+                            timesteps,
+                            encoder_hidden_states,
+                        )
+
+                noise_pred = noise_pred_out.sample if hasattr(noise_pred_out, "sample") else noise_pred_out
                 
                 # Compute loss
                 loss = torch.nn.functional.mse_loss(
@@ -169,7 +295,20 @@ def run_post_training_loop(
                 # Optimizer step
                 optimizer.step()
                 lr_scheduler.step()
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
+            
+            # In low-VRAM mode, move models back to CPU after the step and ready VAE for next encode
+            if use_low_vram:
+                if isinstance(text_encoder, (list, tuple)):
+                    for te in text_encoder:
+                        te.to("cpu")
+                else:
+                    text_encoder.to("cpu")
+                unet.to("cpu")
+                clean_memory_on_device(device)
+
+                # Move VAE back to GPU for next iteration
+                vae.to(device, dtype=vae.dtype)
             
             # Update progress
             current_step += 1
@@ -181,6 +320,17 @@ def run_post_training_loop(
                 break
     
     progress_bar.close()
+    
+    # Restore original device placement
+    logger.info("Restoring model devices after post-training...")
+    vae.to("cpu")
+    if isinstance(text_encoder, (list, tuple)):
+        for i, te in enumerate(text_encoder):
+            te.to(text_encoder_devices[i])
+    else:
+        text_encoder.to(text_encoder_devices[0])
+    unet.to(unet_device)
+    clean_memory_on_device(accelerator.device)
     
     logger.info(f"✓ Post-training complete ({current_step} steps)")
     
@@ -194,6 +344,7 @@ def create_synthetic_dataloader(
     vae,
     resolution: int = 1024,
     accelerator=None,
+    args=None,
 ):
     """
     Create a dataloader for synthetic dataset.
@@ -287,14 +438,47 @@ def create_synthetic_dataloader(
             return data
     
     dataset = SyntheticDataset(synthetic_dataset_path, tokenizers, resolution)
-    
-    dataloader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=0,  # Use 0 for simplicity
-        drop_last=True,
-    )
+
+    # Configure DataLoader workers and perf flags
+    n_workers = 0
+    persistent_workers = False
+    pin_memory = False
+    prefetch_kwargs = {}
+    if args is not None:
+        try:
+            cpu_count = os.cpu_count() or 1
+            n_workers = max(0, min(getattr(args, 'max_data_loader_n_workers', 0) or 0, cpu_count))
+        except Exception:
+            n_workers = 0
+        persistent_workers = bool(getattr(args, 'persistent_data_loader_workers', False) and n_workers > 0)
+        # pin_memory helps when transferring to CUDA/XPU
+        if accelerator is not None and hasattr(accelerator, 'device'):
+            pin_memory = accelerator.device.type in ("cuda", "xpu")
+        # prefetch_factor only valid with workers > 0
+        pf = getattr(args, 'prefetch_factor', None)
+        if pf is not None and n_workers > 0:
+            prefetch_kwargs['prefetch_factor'] = int(pf)
+
+    if n_workers > 0:
+        dataloader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=n_workers,
+            persistent_workers=persistent_workers,
+            pin_memory=pin_memory,
+            drop_last=True,
+            **prefetch_kwargs,
+        )
+    else:
+        dataloader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=0,
+            pin_memory=False,
+            drop_last=True,
+        )
     
     if accelerator is not None:
         dataloader = accelerator.prepare(dataloader)

@@ -57,8 +57,10 @@ class AuroRAModule(LoRAModule):
                 self.anl_H.weight.copy_(torch.eye(self.lora_dim))
 
         self.spline_k = 4
-        self.register_buffer("spline_centers", torch.tensor([-1.0, -0.5, 0.5, 1.0]))
-        self.register_buffer("spline_scale", torch.tensor(1.5))
+        # Centers cover the [-2, 2] support window used for the cardinal cubic B-spline basis.
+        self.register_buffer("spline_centers", torch.tensor([-1.5, -0.5, 0.5, 1.5]))
+        # scale stretches the knot spacing; default keeps the basis close to paper's [-1, 1] regime.
+        self.register_buffer("spline_scale", torch.tensor(1.0))
         if org_module.__class__.__name__ == "Conv2d":
             self.spline_ws = torch.nn.Parameter(torch.empty(self.lora_dim, self.spline_k, 1, 1))
         else:
@@ -89,9 +91,9 @@ class AuroRAModule(LoRAModule):
         else:
             scale = self.scale
 
-        lx = torch.tanh(lx) + self.spline_gate * self._spline_aug(lx)
-        lx = self.anl_H(lx)
-        lx = torch.tanh(lx)
+        nonlinear_fixed = torch.tanh(self.anl_H(torch.tanh(lx)))
+        nonlinear_learned = self._spline_aug(lx)
+        lx = nonlinear_fixed + self.spline_gate * nonlinear_learned
         lx = self.lora_up(lx)
 
         return org_forwarded + lx * self.multiplier * scale
@@ -154,10 +156,9 @@ class AuroRAInfModule(LoRAInfModule):
 
     def anl_forward(self, x):
         z = self.lora_down(x)
-        z = torch.tanh(z) + self.spline_gate * self._spline_aug(z)
-        z = self.anl_H(z)
-        z = torch.tanh(z)
-        return self.lora_up(z)
+        nonlinear_fixed = torch.tanh(self.anl_H(torch.tanh(z)))
+        nonlinear_learned = self._spline_aug(z)
+        return self.lora_up(nonlinear_fixed + self.spline_gate * nonlinear_learned)
 
     def default_forward(self, x):
         return self.org_forward(x) + self.anl_forward(x) * self.multiplier * self.scale
@@ -252,63 +253,67 @@ class AuroRAInfModule(LoRAInfModule):
         return out
 
     def _anl_on_down_weight(self, down_weight: torch.Tensor, device: torch.device) -> torch.Tensor:
+        beta = self.spline_gate.to(torch.float).to(device)
         if len(down_weight.size()) == 2:
             A = down_weight.to(torch.float).to(device)
             H = self.anl_H.weight.to(torch.float).to(device)
-            A1 = torch.tanh(A)
-            beta = self.spline_gate.to(torch.float).to(device)
-            if beta.item() != 0.0:
-                A1 = A1 + beta * self._spline_aug_weight(A)
-            A2 = torch.tanh(H @ A1)
-            return A2
+            fixed = torch.tanh(H @ torch.tanh(A))
+            learned = self._spline_aug_weight(A)
+            return fixed + beta * learned
         else:
             A = down_weight.to(torch.float).to(device)
             H = self.anl_H.weight.squeeze(3).squeeze(2).to(torch.float).to(device)
-            A1 = torch.tanh(A)
-            beta = self.spline_gate.to(torch.float).to(device)
-            if beta.item() != 0.0:
-                A1 = A1 + beta * self._spline_aug_weight(A)
-            A2 = torch.einsum("or,rihw->oihw", H, A1)
-            A2 = torch.tanh(A2)
-            return A2
+            fixed = torch.tanh(torch.einsum("or,rihw->oihw", H, torch.tanh(A)))
+            learned = self._spline_aug_weight(A)
+            return fixed + beta * learned
 
     def _spline_aug(self, z: torch.Tensor) -> torch.Tensor:
-        K = self.spline_k
+        basis_vals = self._evaluate_spline_basis(z)
         aug = torch.zeros_like(z)
-        for m in range(K):
-            c = self.spline_centers[m]
-            a = self.spline_scale
-            phi = torch.tanh(a * (z - c))
+        for idx in range(self.spline_k):
             if z.ndim == 4:
-                w = self.spline_ws[:, m]
-                if w.ndim > 1:
-                    w = w.squeeze()
-                w = w.view(1, -1, 1, 1)
+                w = self.spline_ws[:, idx].view(1, -1, 1, 1)
             elif z.ndim == 3:
-                w = (self.spline_ws[:, m].squeeze()).view(1, 1, -1)
+                w = self.spline_ws[:, idx].view(1, 1, -1)
             elif z.ndim == 2:
-                w = (self.spline_ws[:, m].squeeze()).view(1, -1)
+                w = self.spline_ws[:, idx].view(1, -1)
             else:
-                w = (self.spline_ws[:, m].squeeze()).view([1] * (z.ndim - 1) + [-1])
-            aug = aug + phi * w
+                w = self.spline_ws[:, idx].view([1] * (z.ndim - 1) + [-1])
+            aug = aug + basis_vals[idx] * w
         return aug
 
     def _spline_aug_weight(self, A: torch.Tensor) -> torch.Tensor:
-        K = self.spline_k
+        basis_vals = self._evaluate_spline_basis(A)
         aug = torch.zeros_like(A)
-        for m in range(K):
-            c = self.spline_centers[m]
-            a = self.spline_scale
-            phi = torch.tanh(a * (A - c))
-            w = self.spline_ws[:, m]
+        for idx in range(self.spline_k):
+            w = self.spline_ws[:, idx]
             if w.ndim > 1:
                 w = w.squeeze()
             if len(A.size()) == 2:
                 wv = w.view(-1, 1)
             else:
                 wv = w.view(-1, 1, 1, 1)
-            aug = aug + phi * wv
+            aug = aug + basis_vals[idx] * wv
         return aug
+
+    def _cardinal_cubic_bspline(self, u: torch.Tensor) -> torch.Tensor:
+        abs_u = torch.abs(u)
+        result = torch.zeros_like(u)
+        mask1 = abs_u < 1
+        mask2 = (abs_u >= 1) & (abs_u < 2)
+        if mask1.any():
+            result = result + (((4 - 6 * abs_u**2 + 3 * abs_u**3) / 6) * mask1)
+        if mask2.any():
+            result = result + ((((2 - abs_u) ** 3) / 6) * mask2)
+        return result
+
+    def _evaluate_spline_basis(self, z: torch.Tensor) -> List[torch.Tensor]:
+        scale = torch.clamp(self.spline_scale, min=1e-6)
+        basis = []
+        for center in self.spline_centers:
+            u = (z - center) / scale
+            basis.append(self._cardinal_cubic_bspline(u))
+        return basis
 
     def merge_to(self, sd, dtype, device):
         up_weight = sd["lora_up.weight"].to(torch.float).to(device)

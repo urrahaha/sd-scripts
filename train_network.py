@@ -590,6 +590,12 @@ class NetworkTrainer:
             )
             return
 
+        if args.neon_only_post_train and not args.network_weights:
+            logger.error(
+                "Neon-only post-training requires --network_weights to load an existing LoRA / Neonポストトレーニングのみを実行するには既存LoRAのために--network_weightsが必要です"
+            )
+            return
+
         if cache_latents:
             assert (
                 train_dataset_group.is_latent_cacheable()
@@ -1782,9 +1788,10 @@ class NetworkTrainer:
 
         if is_main_process:
             ckpt_name = train_util.get_last_ckpt_name(args, "." + args.save_model_as)
-            save_model(ckpt_name, network, global_step, num_train_epochs, force_sync_upload=True)
 
-            logger.info("model saved.")
+            if not args.neon_only_post_train:
+                save_model(ckpt_name, network, global_step, num_train_epochs, force_sync_upload=True)
+                logger.info("model saved.")
             
             # Neon post-training phase
             if args.neon_enable:
@@ -1927,14 +1934,24 @@ class NetworkTrainer:
                         # Step 1: Generate synthetic dataset
                         logger.info("Step 1/3: Generating synthetic dataset...")
                         
+                        network_weights_path = None
+                        if getattr(args, "network_weights", None):
+                            network_weights_path = Path(args.network_weights)
+                            ckpt_name = network_weights_path.name
+
                         # Get full path to saved model
                         output_dir = Path(args.output_dir) if hasattr(args, 'output_dir') and args.output_dir else Path(".")
-                        base_model_path = output_dir / ckpt_name
+                        if network_weights_path and network_weights_path.exists():
+                            base_model_path = network_weights_path
+                        else:
+                            base_model_path = output_dir / ckpt_name
                         
                         # Verify the model file exists
                         if not base_model_path.exists():
                             # Try without output_dir (maybe ckpt_name is already full path)
                             base_model_path = Path(ckpt_name)
+                            if network_weights_path and network_weights_path.exists():
+                                base_model_path = network_weights_path
                             if not base_model_path.exists():
                                 logger.error(f"Cannot find saved model at: {ckpt_name}")
                                 logger.error("Neon post-training requires the base model file")
@@ -1975,11 +1992,12 @@ class NetworkTrainer:
                         # Create dataloader for synthetic dataset
                         synthetic_dataloader = create_synthetic_dataloader(
                             synthetic_dataset_path=synthetic_path,
-                            batch_size=args.train_batch_size,
+                            batch_size=getattr(args, "neon_post_training_batch_size", None) or args.train_batch_size,
                             tokenizers=neon_tokenizer,
                             vae=vae,
                             resolution=args.resolution if hasattr(args, 'resolution') else 1024,
                             accelerator=accelerator,
+                            args=args,
                         )
                         
                         # Run post-training loop
@@ -2295,7 +2313,19 @@ def setup_parser() -> argparse.ArgumentParser:
         default=None,
         help="Comma-separated list of negative control words for style preference (e.g., 'Flat,Anime,Painting'). If not specified, uses default CG/oily adjectives / スタイル嗜好のネガティブ制御ワードのコンマ区切りリスト（例: 'Flat,Anime,Painting'）。指定しない場合、デフォルトのCG/oily形容詞を使用",
     )
-    
+    parser.add_argument(
+        "--srpo_use_diff2flow",
+        action="store_true",
+        help="When UNet is v-parameterized, convert v->epsilon before SRPO one-step update / UNetがvパラメータ化されている場合、SRPOのワンステップ更新前にvをεへ変換",
+    )
+    parser.add_argument(
+        "--srpo_d2f_param",
+        type=str,
+        choices=["v", "eps"],
+        default=None,
+        help="Override UNet parameterization for SRPO Diff2Flow bridge (default: infer from scheduler config) / SRPO Diff2Flowブリッジ用にUNetのパラメータ化を上書き（デフォルト: スケジューラ設定から推測）",
+    )
+
     # Neon (Negative Extrapolation from Self-Training) arguments
     parser.add_argument(
         "--neon_enable",
@@ -2324,6 +2354,12 @@ def setup_parser() -> argparse.ArgumentParser:
         type=int,
         default=100,
         help="Number of steps for Neon post-training (used if epochs=0, default: 100) / Neonポストトレーニングのステップ数（エポック=0の場合使用、デフォルト: 100）",
+    )
+    parser.add_argument(
+        "--neon_post_training_batch_size",
+        type=int,
+        default=None,
+        help="Override batch size during Neon post-training (defaults to train_batch_size when unset) / Neonポストトレーニング時のバッチサイズを上書きする（未設定時はtrain_batch_sizeを使用）",
     )
     parser.add_argument(
         "--neon_synthetic_image_percent",

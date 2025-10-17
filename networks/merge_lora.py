@@ -12,6 +12,37 @@ setup_logging()
 import logging
 logger = logging.getLogger(__name__)
 
+
+def cardinal_cubic_bspline(u: torch.Tensor) -> torch.Tensor:
+    abs_u = torch.abs(u)
+    result = torch.zeros_like(u)
+    mask1 = abs_u < 1
+    mask2 = (abs_u >= 1) & (abs_u < 2)
+    if mask1.any():
+        coeff = (4 - 6 * abs_u**2 + 3 * abs_u**3) / 6
+        result = result + coeff * mask1.to(u.dtype)
+    if mask2.any():
+        coeff = ((2 - abs_u) ** 3) / 6
+        result = result + coeff * mask2.to(u.dtype)
+    return result
+
+
+def evaluate_spline_basis(A: torch.Tensor, ws: torch.Tensor, centers: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    scale = torch.clamp(scale, min=torch.tensor(1e-6, dtype=scale.dtype, device=scale.device))
+    aug = torch.zeros_like(A)
+    for idx in range(centers.shape[0]):
+        center = centers[idx]
+        basis = cardinal_cubic_bspline((A - center) / scale)
+        w = ws[:, idx]
+        if w.ndim > 1:
+            w = w.squeeze()
+        if len(A.size()) == 2:
+            wv = w.view(-1, 1)
+        else:
+            wv = w.view(-1, 1, 1, 1)
+        aug = aug + basis * wv
+    return aug
+
 def load_state_dict(file_name, dtype):
     if os.path.splitext(file_name)[1] == ".safetensors":
         sd = load_file(file_name)
@@ -88,98 +119,41 @@ def merge_to_sd_model(text_encoder, unet, models, ratios, merge_dtype):
                 has_anl = h_key in lora_sd
                 if has_anl:
                     H = lora_sd[h_key]
+                    ws_key = key.replace("lora_down.weight", "spline_ws")
+                    gate_key = key.replace("lora_down.weight", "spline_gate")
+                    centers_key = key.replace("lora_down.weight", "spline_centers")
+                    scale_key = key.replace("lora_down.weight", "spline_scale")
+                    has_spline = (
+                        ws_key in lora_sd
+                        and gate_key in lora_sd
+                        and centers_key in lora_sd
+                        and scale_key in lora_sd
+                    )
+                    beta = lora_sd[gate_key] if has_spline else torch.tensor(0.0, dtype=down_weight.dtype)
+                    centers = lora_sd[centers_key] if has_spline else None
+                    scale = lora_sd[scale_key] if has_spline else None
+                    ws = lora_sd[ws_key] if has_spline else None
+
                     if len(down_weight.size()) == 2:
-                        A = down_weight
-                        A1 = torch.tanh(A)
-                        ws_key = key.replace("lora_down.weight", "spline_ws")
-                        gate_key = key.replace("lora_down.weight", "spline_gate")
-                        centers_key = key.replace("lora_down.weight", "spline_centers")
-                        scale_key = key.replace("lora_down.weight", "spline_scale")
-                        if (
-                            ws_key in lora_sd
-                            and gate_key in lora_sd
-                            and centers_key in lora_sd
-                            and scale_key in lora_sd
-                            and float(lora_sd[gate_key]) != 0.0
-                        ):
-                            ws = lora_sd[ws_key]
-                            centers = lora_sd[centers_key]
-                            a = lora_sd[scale_key]
-                            beta = lora_sd[gate_key]
-                            K = centers.shape[0]
-                            aug = 0
-                            for m in range(K):
-                                c = centers[m]
-                                phi = torch.tanh(a * (A - c))
-                                w = ws[:, m]
-                                if w.ndim > 1:
-                                    w = w.squeeze()
-                                wv = w.view(-1, 1)
-                                aug = aug + phi * wv
-                            A1 = A1 + beta * aug
-                        A_tilde = torch.tanh(H @ A1)
+                        fixed = torch.tanh(H @ torch.tanh(down_weight))
+                        if has_spline and float(beta) != 0.0:
+                            learned = evaluate_spline_basis(down_weight, ws, centers, scale)
+                            fixed = fixed + beta * learned
+                        A_tilde = fixed
                     elif down_weight.size()[2:4] == (1, 1):
                         H2 = H.squeeze(3).squeeze(2)
-                        A = down_weight
-                        A1 = torch.tanh(A)
-                        ws_key = key.replace("lora_down.weight", "spline_ws")
-                        gate_key = key.replace("lora_down.weight", "spline_gate")
-                        centers_key = key.replace("lora_down.weight", "spline_centers")
-                        scale_key = key.replace("lora_down.weight", "spline_scale")
-                        if (
-                            ws_key in lora_sd
-                            and gate_key in lora_sd
-                            and centers_key in lora_sd
-                            and scale_key in lora_sd
-                            and float(lora_sd[gate_key]) != 0.0
-                        ):
-                            ws = lora_sd[ws_key]
-                            centers = lora_sd[centers_key]
-                            a = lora_sd[scale_key]
-                            beta = lora_sd[gate_key]
-                            K = centers.shape[0]
-                            aug = 0
-                            for m in range(K):
-                                c = centers[m]
-                                phi = torch.tanh(a * (A - c))
-                                w = ws[:, m]
-                                if w.ndim > 1:
-                                    w = w.squeeze()
-                                wv = w.view(-1, 1, 1, 1)
-                                aug = aug + phi * wv
-                            A1 = A1 + beta * aug
-                        A_tilde = torch.tanh(torch.einsum("or,rihw->oihw", H2, A1))
+                        fixed = torch.tanh(torch.einsum("or,rihw->oihw", H2, torch.tanh(down_weight)))
+                        if has_spline and float(beta) != 0.0:
+                            learned = evaluate_spline_basis(down_weight, ws, centers, scale)
+                            fixed = fixed + beta * learned
+                        A_tilde = fixed
                     else:
                         H2 = H.squeeze(3).squeeze(2)
-                        A = down_weight
-                        A1 = torch.tanh(A)
-                        ws_key = key.replace("lora_down.weight", "spline_ws")
-                        gate_key = key.replace("lora_down.weight", "spline_gate")
-                        centers_key = key.replace("lora_down.weight", "spline_centers")
-                        scale_key = key.replace("lora_down.weight", "spline_scale")
-                        if (
-                            ws_key in lora_sd
-                            and gate_key in lora_sd
-                            and centers_key in lora_sd
-                            and scale_key in lora_sd
-                            and float(lora_sd[gate_key]) != 0.0
-                        ):
-                            ws = lora_sd[ws_key]
-                            centers = lora_sd[centers_key]
-                            a = lora_sd[scale_key]
-                            beta = lora_sd[gate_key]
-                            K = centers.shape[0]
-                            aug = 0
-                            for m in range(K):
-                                c = centers[m]
-                                phi = torch.tanh(a * (A - c))
-                                w = ws[:, m]
-                                if w.ndim > 1:
-                                    w = w.squeeze()
-                                wv = w.view(-1, 1, 1, 1)
-                                aug = aug + phi * wv
-                            A1 = A1 + beta * aug
-                        A_tilde = torch.tanh(torch.einsum("or,rihw->oihw", H2, A1))
+                        fixed = torch.tanh(torch.einsum("or,rihw->oihw", H2, torch.tanh(down_weight)))
+                        if has_spline and float(beta) != 0.0:
+                            learned = evaluate_spline_basis(down_weight, ws, centers, scale)
+                            fixed = fixed + beta * learned
+                        A_tilde = fixed
                 else:
                     A_tilde = down_weight
 
