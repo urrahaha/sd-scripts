@@ -29,6 +29,8 @@ class SdxlNetworkTrainer(train_network.NetworkTrainer):
         self.is_sdxl = True
         self._srpo_reward_model = None
         self._srpo_step = 0
+        self._srpo_logged_config = False
+        self._srpo_logged_no_reward_model = False
 
     def assert_extra_args(
         self,
@@ -187,22 +189,34 @@ class SdxlNetworkTrainer(train_network.NetworkTrainer):
         return encoder_hidden_states1, encoder_hidden_states2, pool2
 
     def on_step_start(self, args, accelerator, network, text_encoders, unet, batch, weight_dtype, is_train: bool = True):
-        if getattr(args, 'srpo_enable', False) and SRPO_AVAILABLE and self._srpo_reward_model is None:
-            # Validate SRPO args once
+        if not getattr(args, 'srpo_enable', False) or not SRPO_AVAILABLE:
+            return
+
+        if not self._srpo_logged_config:
             try:
                 srpo_train_utils.validate_srpo_args(args)
             except Exception:
                 pass
-            # Build reward model
-            try:
-                self._srpo_reward_model = srpo_reward_models.build_reward_model(
-                    getattr(args, 'srpo_reward_model', 'HPS'),
-                    device=str(accelerator.device),
-                    dtype=weight_dtype,
-                )
-            except Exception as e:
-                logger.warning(f"SRPO: failed to initialize reward model: {e}. Disabling SRPO for this run.")
-                setattr(args, 'srpo_enable', False)
+            self._srpo_logged_config = True
+
+        if self._srpo_reward_model is not None:
+            return
+
+        if not args.srpo_use_reward_model:
+            if not self._srpo_logged_no_reward_model:
+                logger.info("SRPO: Not using reward model")
+                self._srpo_logged_no_reward_model = True
+            return
+
+        try:
+            self._srpo_reward_model = srpo_reward_models.build_reward_model(
+                getattr(args, 'srpo_reward_model', 'HPS'),
+                device=str(accelerator.device),
+                dtype=weight_dtype,
+            )
+        except Exception as e:
+            logger.warning(f"SRPO: failed to initialize reward model: {e}. Disabling SRPO for this run.")
+            setattr(args, 'srpo_enable', False)
 
     def process_batch(
         self,

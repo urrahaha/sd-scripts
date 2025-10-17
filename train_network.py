@@ -2243,7 +2243,7 @@ def setup_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--srpo_use_reward_model",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
         default=True,
         help="Use reward model for preference guidance. Disable for styles (e.g., anime) where existing models are biased / 選好ガイダンスに報酬モデルを使用。既存モデルにバイアスがあるスタイル（アニメなど）では無効化",
     )

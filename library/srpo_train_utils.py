@@ -12,11 +12,21 @@ from typing import Optional, Tuple
 from diffusers.image_processor import VaeImageProcessor
 from tqdm import tqdm
 import logging
+from contextlib import nullcontext
 
 from . import srpo_reward_models
 from . import sdxl_train_util
 
 logger = logging.getLogger(__name__)
+
+
+def _unpack_unet_output(output):
+    """Return the primary tensor from a UNet forward output."""
+    if hasattr(output, "sample"):
+        return output.sample
+    if isinstance(output, (list, tuple)):
+        return output[0]
+    return output
 
 
 def prepare_latent_image_ids_sdxl(batch_size, height, width, device, dtype):
@@ -97,29 +107,58 @@ def run_sdxl_sample_step(
     encoder_hidden_states = encoder_hidden_states.to(device=device, dtype=weight_dtype)
     pooled_prompt_embeds = pooled_prompt_embeds.to(device=device, dtype=weight_dtype)
     add_time_ids = add_time_ids.to(device=device, dtype=weight_dtype)
+    latents = latents.to(device=device, dtype=weight_dtype)
+
+    if not hasattr(run_sdxl_sample_step, "_srpo_logged_shapes"):
+        logger.info(
+            "SRPO sample conditioning shapes -- encoder_hidden_states=%s, pooled=%s, add_time_ids=%s",
+            tuple(encoder_hidden_states.shape),
+            tuple(pooled_prompt_embeds.shape),
+            tuple(add_time_ids.shape),
+        )
+        run_sdxl_sample_step._srpo_logged_shapes = True
     vector_embedding = torch.cat([pooled_prompt_embeds, add_time_ids], dim=-1)
 
     for i, t in enumerate(timesteps):
         # Expand latents for classifier-free guidance
         latent_model_input = torch.cat([latents] * 2) if guidance_scale > 1.0 else latents
+        latent_model_input = latent_model_input.to(device=device, dtype=weight_dtype)
 
         # Predict noise
         with torch.no_grad():
             noise_pred = unet(
                 latent_model_input,
                 t,
-                encoder_hidden_states=encoder_hidden_states,
+                context=encoder_hidden_states,
                 y=vector_embedding,
                 return_dict=False,
-            )[0]
+            )
+            noise_pred = _unpack_unet_output(noise_pred)
+
+        if not hasattr(run_sdxl_sample_step, "_srpo_logged_unet_io"):
+            logger.info(
+                "SRPO sample UNet IO -- latent_in=%s, noise_raw=%s",
+                tuple(latent_model_input.shape),
+                tuple(noise_pred.shape),
+            )
+            run_sdxl_sample_step._srpo_logged_unet_io = True
         
         # Perform guidance
         if guidance_scale > 1.0:
             noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
             noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+
+        if not hasattr(run_sdxl_sample_step, "_srpo_logged_unet_post"):
+            logger.info(
+                "SRPO sample post-CFG -- noise_pred=%s, latents=%s",
+                tuple(noise_pred.shape),
+                tuple(latents.shape),
+            )
+            run_sdxl_sample_step._srpo_logged_unet_post = True
         
         # Compute previous sample
         latents = scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+        latents = latents.to(device=device, dtype=weight_dtype)
     
     return latents
 
@@ -159,8 +198,12 @@ def srpo_train_step_sdxl(
     neg_control_words = getattr(args, 'srpo_negative_controls', None)
     
     # Discount factors for reward weighting
-    discount = torch.linspace(discount_pos[0], discount_pos[1], timestep_length).to(device)
-    discount_inversion = torch.linspace(discount_inv[0], discount_inv[1], timestep_length).to(device)
+    discount = torch.linspace(
+        discount_pos[0], discount_pos[1], timestep_length, device=device, dtype=weight_dtype
+    )
+    discount_inversion = torch.linspace(
+        discount_inv[0], discount_inv[1], timestep_length, device=device, dtype=weight_dtype
+    )
     
     # Determine batch size and resolution
     if "target_sizes_hw" in batch and batch["target_sizes_hw"] is not None:
@@ -182,9 +225,22 @@ def srpo_train_step_sdxl(
     encoder_hidden_states1 = precomputed_encoder_hidden_states1 if precomputed_encoder_hidden_states1 is not None else batch.get("text_encoder_outputs1")
     encoder_hidden_states2 = precomputed_encoder_hidden_states2 if precomputed_encoder_hidden_states2 is not None else batch.get("text_encoder_outputs2")
     pooled_prompt_embeds = precomputed_pooled_prompt_embeds if precomputed_pooled_prompt_embeds is not None else batch.get("text_encoder_pool2")
+
+    if encoder_hidden_states1 is None or encoder_hidden_states2 is None or pooled_prompt_embeds is None:
+        raise RuntimeError("SRPO requires text encoder outputs for SDXL but they were missing in the batch.")
     
     # Concatenate hidden states for SDXL
     encoder_hidden_states = torch.cat([encoder_hidden_states1, encoder_hidden_states2], dim=-1)
+
+    if not hasattr(srpo_train_step_sdxl, "_srpo_logged_text_shapes"):
+        logger.info(
+            "SRPO encodings shapes -- enc1=%s, enc2=%s, pooled=%s, concatenated=%s",
+            tuple(encoder_hidden_states1.shape),
+            tuple(encoder_hidden_states2.shape),
+            tuple(pooled_prompt_embeds.shape),
+            tuple(encoder_hidden_states.shape),
+        )
+        srpo_train_step_sdxl._srpo_logged_text_shapes = True
     
     # Get add_time_ids for SDXL
     add_time_ids = batch.get("add_time_ids")
@@ -278,24 +334,6 @@ def srpo_train_step_sdxl(
     def map_idx(i: int) -> int:
         return int(round(i / float(max(1, timestep_length - 1)) * (num_train_t - 1)))
 
-    discount = torch.linspace(discount_pos[0], discount_pos[1], timestep_length, device=device, dtype=weight_dtype)
-    discount_inversion = torch.linspace(discount_inv[0], discount_inv[1], timestep_length, device=device, dtype=weight_dtype)
-
-    # Captions
-    captions = batch.get("captions", [""] * batch_size)
-    pos_control_words = getattr(args, 'srpo_positive_controls', None)
-    neg_control_words = getattr(args, 'srpo_negative_controls', None)
-    if pos_control_words and len(pos_control_words) > 0:
-        pos_control = pos_control_words[global_step % len(pos_control_words)]
-    else:
-        pos_control = srpo_reward_models.get_random_realism_adjective(global_step)
-    if neg_control_words and len(neg_control_words) > 0:
-        neg_control = neg_control_words[global_step % len(neg_control_words)]
-    else:
-        neg_control = srpo_reward_models.get_random_cg_oily_adjective(global_step)
-    pos_captions = [f"{pos_control}. {cap}" for cap in captions]
-    neg_captions = [f"{neg_control}. {cap}" for cap in captions]
-
     # Shared noise prior ε
     eps = torch.randn_like(latents_x0)
 
@@ -317,21 +355,26 @@ def srpo_train_step_sdxl(
 
         # Inject noise at t_start: x_t = alpha_start * x0 + sigma_start * eps
         x_t = alpha_start * latents_x0 + sigma_start * eps
+        x_t = x_t.to(device=device, dtype=weight_dtype)
 
         # Predict noise at t_start
         unet.train()
         t_tensor = torch.tensor([t_start_idx], device=device, dtype=torch.long)
-        encoder_hidden_states_local = encoder_hidden_states[:batch_size].to(device=device, dtype=weight_dtype)
-        pooled_prompt_embeds_local = pooled_prompt_embeds[:batch_size].to(device=device, dtype=weight_dtype)
-        add_time_ids_local = add_time_ids[:batch_size].to(device=device, dtype=weight_dtype)
-        vector_embedding_local = torch.cat([pooled_prompt_embeds_local, add_time_ids_local], dim=-1)
+        target_dtype = x_t.dtype
+        encoder_hidden_states_local = encoder_hidden_states[:batch_size].to(device=device, dtype=target_dtype)
+        pooled_prompt_embeds_local = pooled_prompt_embeds[:batch_size].to(device=device, dtype=target_dtype)
+        add_time_ids_local = add_time_ids[:batch_size].to(device=device, dtype=target_dtype)
+        vector_embedding_local = torch.cat([pooled_prompt_embeds_local, add_time_ids_local], dim=-1).to(dtype=target_dtype)
+        unet_latents = x_t.detach().to(dtype=target_dtype)
+        unet_latents.requires_grad_(True)
         noise_pred = unet(
-            x_t.detach().requires_grad_(True),
+            unet_latents,
             t_tensor,
-            encoder_hidden_states=encoder_hidden_states_local,
+            context=encoder_hidden_states_local,
             y=vector_embedding_local,
             return_dict=False,
-        )[0]
+        )
+        noise_pred = _unpack_unet_output(noise_pred)
 
         # If requested, convert Diff2Flow-style v-parameterized output to epsilon using scheduler alphas
         # This aligns the single-step update with diffusion semantics when UNet outputs v.
@@ -356,11 +399,21 @@ def srpo_train_step_sdxl(
         use_reward_model = getattr(args, 'srpo_use_reward_model', True) and reward_model is not None
         if use_reward_model:
             vae.eval()
-            with torch.autocast("cuda", dtype=weight_dtype):
-                dec_in = x0_hat / vae.config.scaling_factor
+            vae_dtype = next(vae.parameters()).dtype
+            use_cuda_autocast = isinstance(device, str) and device.startswith("cuda") and torch.cuda.is_available()
+            # Ensure VAE is on the target device to match input tensor device
+            target_device = torch.device(device) if isinstance(device, str) else device
+            vae_param_device = next(vae.parameters()).device
+            if vae_param_device != target_device:
+                vae.to(target_device, dtype=vae_dtype)
+            decode_ctx = torch.autocast("cuda", dtype=vae_dtype) if use_cuda_autocast else nullcontext()
+            with decode_ctx:
+                dec_in = (x0_hat / vae.config.scaling_factor).to(device=device, dtype=vae_dtype)
                 images = vae.decode(dec_in, return_dict=False)[0]
                 images = (images / 2 + 0.5).clamp(0, 1)
-            with torch.amp.autocast('cuda'):
+            images = images.to(device=device, dtype=torch.float32)
+            reward_ctx = torch.autocast("cuda", dtype=torch.float32) if use_cuda_autocast else nullcontext()
+            with reward_ctx:
                 if branch == "denoise":
                     rewards = reward_model.srp_cfg(pos_captions, neg_captions, images, k_coeff)
                 else:
@@ -368,15 +421,24 @@ def srpo_train_step_sdxl(
             loss_branch = F.relu(-rewards + reward_threshold).mean()
         else:
             # Preference-weighted MSE w.r.t. rollout x0
+            # NOTE: Compute the loss in float32 to avoid bf16-only graphs that can
+            # trigger "Found dtype BFloat16 but expected Float" during backward on
+            # some PyTorch/driver combos. Cast only for the loss; gradients still
+            # flow back through the float32 path safely.
             if branch == "denoise":
-                weight = 1.0 + k_coeff
+                weight = (1.0 + k_coeff).float()
             else:
-                weight = 1.0 - k_coeff
-            loss_branch = F.mse_loss(x0_hat, latents_x0, reduction='mean') * weight
+                weight = (1.0 - k_coeff).float()
+            loss_branch = F.mse_loss(x0_hat.float(), latents_x0.float(), reduction='mean') * weight
 
         losses.append(loss_branch)
 
-    return sum(losses) / len(losses)
+    # Ensure the returned loss is float32 for a stable backward pass under AMP/bfloat16.
+    # Some optimizers/backward paths expect a Float (fp32) scalar loss.
+    # Also upcast any bf16 losses accumulated above to fp32 before the final mean.
+    losses = [l.float() for l in losses]
+    loss = sum(losses) / len(losses)
+    return loss
 
 
 def should_use_srpo_training(args) -> bool:
@@ -403,7 +465,10 @@ def validate_srpo_args(args):
     if getattr(args, 'cache_text_encoder_outputs', False):
         logger.warning("SRPO training works better without cached text encoder outputs for dynamic prompts.")
     
-    logger.info(f"SRPO Training enabled with {reward_model_type} reward model")
+    if args.srpo_use_reward_model:
+        logger.info(f"SRPO Training enabled with {reward_model_type} reward model")
+    else:
+        logger.info("SRPO Training enabled")
     logger.info(f"SRPO timestep length: {getattr(args, 'srpo_timestep_length', 100)}")
     logger.info(f"SRPO discount (pos): {getattr(args, 'srpo_discount_pos', [0.1, 0.25])}")
     logger.info(f"SRPO discount (inv): {getattr(args, 'srpo_discount_inv', [0.3, 0.01])}")
