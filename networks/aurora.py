@@ -99,12 +99,22 @@ class AuroRAModule(LoRAModule):
         return org_forwarded + lx * self.multiplier * scale
 
     def _spline_aug(self, z: torch.Tensor) -> torch.Tensor:
+        # Match inference: use cardinal cubic B-spline basis with centers/scale
         K = self.spline_k
+        scale = torch.clamp(self.spline_scale, min=1e-6)
         aug = torch.zeros_like(z)
         for m in range(K):
-            c = self.spline_centers[m]
-            a = self.spline_scale
-            phi = torch.tanh(a * (z - c))
+            center = self.spline_centers[m]
+            u = (z - center) / scale
+            abs_u = torch.abs(u)
+            basis = torch.zeros_like(u)
+            mask1 = abs_u < 1
+            mask2 = (abs_u >= 1) & (abs_u < 2)
+            if mask1.any():
+                basis = basis + ((4 - 6 * abs_u**2 + 3 * abs_u**3) / 6) * mask1
+            if mask2.any():
+                basis = basis + (((2 - abs_u) ** 3) / 6) * mask2
+
             if z.ndim == 4:
                 w = self.spline_ws[:, m]
                 if w.ndim > 1:
@@ -116,7 +126,7 @@ class AuroRAModule(LoRAModule):
                 w = (self.spline_ws[:, m].squeeze()).view(1, -1)
             else:
                 w = (self.spline_ws[:, m].squeeze()).view([1] * (z.ndim - 1) + [-1])
-            aug = aug + phi * w
+            aug = aug + basis * w
         return aug
 
 
@@ -146,8 +156,8 @@ class AuroRAInfModule(LoRAInfModule):
                 self.anl_H.weight.copy_(torch.eye(self.lora_dim))
 
         self.spline_k = 4
-        self.register_buffer("spline_centers", torch.tensor([-1.0, -0.5, 0.5, 1.0]))
-        self.register_buffer("spline_scale", torch.tensor(1.5))
+        self.register_buffer("spline_centers", torch.tensor([-1.5, -0.5, 0.5, 1.5]))
+        self.register_buffer("spline_scale", torch.tensor(1.0))
         if org_module.__class__.__name__ == "Conv2d":
             self.spline_ws = torch.nn.Parameter(torch.zeros(self.lora_dim, self.spline_k, 1, 1))
         else:
