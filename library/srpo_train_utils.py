@@ -122,6 +122,7 @@ def run_sdxl_sample_step(
     for i, t in enumerate(timesteps):
         # Expand latents for classifier-free guidance
         latent_model_input = torch.cat([latents] * 2) if guidance_scale > 1.0 else latents
+        # Keep latent input in model weight dtype to match embeddings (avoids dtype assert in UNet)
         latent_model_input = latent_model_input.to(device=device, dtype=weight_dtype)
 
         # Predict noise
@@ -158,6 +159,7 @@ def run_sdxl_sample_step(
         
         # Compute previous sample
         latents = scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+        # Some schedulers return fp32 by default; cast back to the model's weight dtype
         latents = latents.to(device=device, dtype=weight_dtype)
     
     return latents
@@ -297,22 +299,29 @@ def srpo_train_step_sdxl(
 
     add_time_ids = add_time_ids.to(device=device, dtype=weight_dtype)
     
-    # Expand for CFG if needed
-    if guidance_scale > 1.0:
-        encoder_hidden_states = torch.cat([encoder_hidden_states] * 2)
-        pooled_prompt_embeds = torch.cat([pooled_prompt_embeds] * 2)
-        add_time_ids = torch.cat([add_time_ids] * 2)
-    
-    # Step 1: Online rollout to get x0 sample
+    # Determine whether we use a reward model (affects downstream execution but rollout is still required
+    # to construct x_t by re-noising x0). Keep base conditionings untouched for training call.
+    use_reward_model = getattr(args, 'srpo_use_reward_model', True) and reward_model is not None
+
+    # Step 1: Online rollout to get x0 sample (always required to construct x_t)
     latents_x0 = torch.randn((batch_size, 4, height // 8, width // 8), device=device, dtype=weight_dtype)
+    # Prepare CFG-expanded conditionings only for the rollout to avoid enlarging tensors used by training UNet call
+    enc_for_rollout = encoder_hidden_states
+    pool_for_rollout = pooled_prompt_embeds
+    timeids_for_rollout = add_time_ids
+    if guidance_scale > 1.0:
+        enc_for_rollout = torch.cat([enc_for_rollout] * 2)
+        pool_for_rollout = torch.cat([pool_for_rollout] * 2)
+        timeids_for_rollout = torch.cat([timeids_for_rollout] * 2)
+
     with torch.no_grad():
         latents_x0 = run_sdxl_sample_step(
             unet=unet,
             scheduler=scheduler,
             latents=latents_x0,
-            encoder_hidden_states=encoder_hidden_states,
-            pooled_prompt_embeds=pooled_prompt_embeds,
-            add_time_ids=add_time_ids,
+            encoder_hidden_states=enc_for_rollout,
+            pooled_prompt_embeds=pool_for_rollout,
+            add_time_ids=timeids_for_rollout,
             guidance_scale=guidance_scale,
             num_inference_steps=timestep_length,
             device=device,
@@ -350,108 +359,110 @@ def srpo_train_step_sdxl(
     def map_idx(i: int) -> int:
         return int(round(i / float(max(1, timestep_length - 1)) * (num_train_t - 1)))
 
-    # Shared noise prior ε
-    eps = torch.randn_like(latents_x0)
+    # Shared noise prior ε and common t_start quantities
+    latent_shape = (batch_size, 4, height // 8, width // 8)
+    eps = torch.randn(latent_shape, device=device, dtype=weight_dtype)
+
+    start_i = mid_timestep  # same for both branches
+    t_start_idx = map_idx(start_i)
+    alpha_start, sigma_start = _alpha_sigma_from_scheduler(scheduler, t_start_idx, device, weight_dtype)
+
+    # Inject noise at t_start: x_t = alpha_start * x0 + sigma_start * eps
+    x_t = alpha_start * latents_x0 + sigma_start * eps
+    x_t = x_t.to(device=device, dtype=weight_dtype)
+
+    # Predict noise at t_start once and reuse for both branches
+    unet.train()
+    t_tensor = torch.tensor([t_start_idx], device=device, dtype=torch.long)
+    target_dtype = x_t.dtype
+    encoder_hidden_states_local = encoder_hidden_states.to(device=device, dtype=target_dtype)
+    pooled_prompt_embeds_local = pooled_prompt_embeds.to(device=device, dtype=target_dtype)
+    add_time_ids_local = add_time_ids.to(device=device, dtype=target_dtype)
+    vector_embedding_local = torch.cat([pooled_prompt_embeds_local, add_time_ids_local], dim=-1).to(dtype=target_dtype)
+    unet_latents = x_t.detach().to(dtype=target_dtype)
+    unet_latents.requires_grad_(True)
+    noise_pred = unet(
+        unet_latents,
+        t_tensor,
+        context=encoder_hidden_states_local,
+        y=vector_embedding_local,
+        return_dict=False,
+    )
+    noise_pred = _unpack_unet_output(noise_pred)
+
+    # If requested, convert Diff2Flow-style v-parameterized output to epsilon using scheduler alphas
+    # This aligns the single-step update with diffusion semantics when UNet outputs v.
+    if getattr(args, 'srpo_use_diff2flow', False):
+        # Determine parameterization from args override or scheduler config
+        d2f_param = getattr(args, 'srpo_d2f_param', None)
+        pred_type = getattr(getattr(scheduler, 'config', object()), 'prediction_type', 'epsilon')
+        # Heuristic: prefer explicit arg; else infer from scheduler config
+        use_v = (d2f_param == 'v') or (d2f_param is None and isinstance(pred_type, str) and pred_type.lower().startswith('v'))
+        if use_v:
+            # Convert v -> eps: eps = sqrt(alpha_cum) * v + sqrt(1 - alpha_cum) * x_t
+            # alpha_start is sqrt(alpha_cum), sigma_start is sqrt(1 - alpha_cum)
+            noise_pred = (alpha_start * noise_pred) + (sigma_start * x_t)
 
     losses = []
-    for branch in ("denoise", "inversion"):
-        if branch == "denoise":
-            start_i = mid_timestep
-            end_i = max(0, mid_timestep - k)
-            k_coeff = discount[mid_timestep]
-        else:
-            start_i = mid_timestep
-            end_i = min(timestep_length - 1, mid_timestep + k)
-            k_coeff = discount_inversion[mid_timestep]
+    if use_reward_model:
+        # Prepare shared VAE context once
+        vae.eval()
+        vae_dtype = next(vae.parameters()).dtype
+        use_cuda_autocast = isinstance(device, str) and device.startswith("cuda") and torch.cuda.is_available()
+        target_device = torch.device(device) if isinstance(device, str) else device
+        vae_param_device = next(vae.parameters()).device
+        if vae_param_device != target_device:
+            vae.to(target_device, dtype=vae_dtype)
 
-        t_start_idx = map_idx(start_i)
-        t_end_idx = map_idx(end_i)
-        alpha_start, sigma_start = _alpha_sigma_from_scheduler(scheduler, t_start_idx, device, weight_dtype)
-        alpha_end, sigma_end = _alpha_sigma_from_scheduler(scheduler, t_end_idx, device, weight_dtype)
-
-        # Inject noise at t_start: x_t = alpha_start * x0 + sigma_start * eps
-        x_t = alpha_start * latents_x0 + sigma_start * eps
-        x_t = x_t.to(device=device, dtype=weight_dtype)
-
-        # Predict noise at t_start
-        unet.train()
-        t_tensor = torch.tensor([t_start_idx], device=device, dtype=torch.long)
-        target_dtype = x_t.dtype
-        encoder_hidden_states_local = encoder_hidden_states[:batch_size].to(device=device, dtype=target_dtype)
-        pooled_prompt_embeds_local = pooled_prompt_embeds[:batch_size].to(device=device, dtype=target_dtype)
-        add_time_ids_local = add_time_ids[:batch_size].to(device=device, dtype=target_dtype)
-        vector_embedding_local = torch.cat([pooled_prompt_embeds_local, add_time_ids_local], dim=-1).to(dtype=target_dtype)
-        unet_latents = x_t.detach().to(dtype=target_dtype)
-        unet_latents.requires_grad_(True)
-        noise_pred = unet(
-            unet_latents,
-            t_tensor,
-            context=encoder_hidden_states_local,
-            y=vector_embedding_local,
-            return_dict=False,
+        # Compute both branch x0 hats, then decode in a single pass to halve VAE overhead
+        branch_specs = (
+            ("denoise", max(0, mid_timestep - k), discount[mid_timestep]),
+            ("inversion", min(timestep_length - 1, mid_timestep + k), discount_inversion[mid_timestep]),
         )
-        noise_pred = _unpack_unet_output(noise_pred)
+        x0_hats, k_coeffs, names = [], [], []
+        for name, end_i, k_coeff in branch_specs:
+            t_end_idx = map_idx(end_i)
+            alpha_end, sigma_end = _alpha_sigma_from_scheduler(scheduler, t_end_idx, device, weight_dtype)
+            dsigma = sigma_end - sigma_start
+            x_end = x_t + dsigma * noise_pred
+            x0_hat = (x_end - sigma_end * eps) / torch.clamp(alpha_end, min=1e-6)
+            x0_hats.append(x0_hat)
+            k_coeffs.append(k_coeff)
+            names.append(name)
 
-        # If requested, convert Diff2Flow-style v-parameterized output to epsilon using scheduler alphas
-        # This aligns the single-step update with diffusion semantics when UNet outputs v.
-        if getattr(args, 'srpo_use_diff2flow', False):
-            # Determine parameterization from args override or scheduler config
-            d2f_param = getattr(args, 'srpo_d2f_param', None)
-            pred_type = getattr(getattr(scheduler, 'config', object()), 'prediction_type', 'epsilon')
-            # Heuristic: prefer explicit arg; else infer from scheduler config
-            use_v = (d2f_param == 'v') or (d2f_param is None and isinstance(pred_type, str) and pred_type.lower().startswith('v'))
-            if use_v:
-                # Convert v -> eps: eps = sqrt(alpha_cum) * v + sqrt(1 - alpha_cum) * x_t
-                # alpha_start is sqrt(alpha_cum), sigma_start is sqrt(1 - alpha_cum)
-                noise_pred = (alpha_start * noise_pred) + (sigma_start * x_t)
+        decode_ctx = torch.autocast("cuda", dtype=vae_dtype) if use_cuda_autocast else nullcontext()
+        with decode_ctx:
+            dec_in = torch.cat([x / vae.config.scaling_factor for x in x0_hats], dim=0).to(device=target_device, dtype=vae_dtype)
+            images_all = vae.decode(dec_in, return_dict=False)[0]
+            images_all = (images_all / 2 + 0.5).clamp(0, 1)
+        images_all = images_all.to(device=target_device, dtype=torch.float32)
 
-        # One-step move: x_end = x_t + (sigma_end - sigma_start) * noise_pred
-        dsigma = sigma_end - sigma_start
-        x_end = x_t + dsigma * noise_pred
-
-        # Closed-form recovery at t_end
+        bs = batch_size
+        images_denoise, images_inversion = images_all[:bs], images_all[bs:]
+        reward_ctx = torch.autocast("cuda", dtype=torch.float32) if use_cuda_autocast else nullcontext()
+        with reward_ctx:
+            rewards_denoise = reward_model.srp_cfg(pos_captions, neg_captions, images_denoise, k_coeffs[0])
+            rewards_inversion = reward_model.srp_cfg(neg_captions, pos_captions, images_inversion, k_coeffs[1])
+        losses.append(F.relu(-rewards_denoise + reward_threshold).mean())
+        losses.append(F.relu(-rewards_inversion + reward_threshold).mean())
+    else:
+        # Preference-weighted MSE w.r.t. rollout x0 for both branches (no VAE/reward model)
+        end_i_denoise = max(0, mid_timestep - k)
+        end_i_inversion = min(timestep_length - 1, mid_timestep + k)
+        # Denoise branch
+        alpha_end, sigma_end = _alpha_sigma_from_scheduler(scheduler, map_idx(end_i_denoise), device, weight_dtype)
+        x_end = x_t + (sigma_end - sigma_start) * noise_pred
         x0_hat = (x_end - sigma_end * eps) / torch.clamp(alpha_end, min=1e-6)
-
-        use_reward_model = getattr(args, 'srpo_use_reward_model', True) and reward_model is not None
-        if use_reward_model:
-            vae.eval()
-            vae_dtype = next(vae.parameters()).dtype
-            use_cuda_autocast = isinstance(device, str) and device.startswith("cuda") and torch.cuda.is_available()
-            # Ensure VAE is on the target device to match input tensor device
-            target_device = torch.device(device) if isinstance(device, str) else device
-            vae_param_device = next(vae.parameters()).device
-            if vae_param_device != target_device:
-                vae.to(target_device, dtype=vae_dtype)
-            decode_ctx = torch.autocast("cuda", dtype=vae_dtype) if use_cuda_autocast else nullcontext()
-            with decode_ctx:
-                dec_in = (x0_hat / vae.config.scaling_factor).to(device=device, dtype=vae_dtype)
-                images = vae.decode(dec_in, return_dict=False)[0]
-                images = (images / 2 + 0.5).clamp(0, 1)
-            images = images.to(device=device, dtype=torch.float32)
-            reward_ctx = torch.autocast("cuda", dtype=torch.float32) if use_cuda_autocast else nullcontext()
-            with reward_ctx:
-                if branch == "denoise":
-                    rewards = reward_model.srp_cfg(pos_captions, neg_captions, images, k_coeff)
-                else:
-                    rewards = reward_model.srp_cfg(neg_captions, pos_captions, images, k_coeff)
-            loss_branch = F.relu(-rewards + reward_threshold).mean()
-        else:
-            # Preference-weighted MSE w.r.t. rollout x0
-            # NOTE: Compute the loss in float32 to avoid bf16-only graphs that can
-            # trigger "Found dtype BFloat16 but expected Float" during backward on
-            # some PyTorch/driver combos. Cast only for the loss; gradients still
-            # flow back through the float32 path safely.
-            if branch == "denoise":
-                weight = (1.0 + k_coeff).float()
-            else:
-                weight = (1.0 - k_coeff).float()
-            loss_branch = F.mse_loss(x0_hat.float(), latents_x0.float(), reduction='mean') * weight
-
-        losses.append(loss_branch)
+        weight = (1.0 + discount[mid_timestep]).float()
+        losses.append(F.mse_loss(x0_hat.float(), latents_x0.float(), reduction='mean') * weight)
+        # Inversion branch
+        alpha_end, sigma_end = _alpha_sigma_from_scheduler(scheduler, map_idx(end_i_inversion), device, weight_dtype)
+        x_end = x_t + (sigma_end - sigma_start) * noise_pred
+        x0_hat = (x_end - sigma_end * eps) / torch.clamp(alpha_end, min=1e-6)
+        weight = (1.0 - discount_inversion[mid_timestep]).float()
+        losses.append(F.mse_loss(x0_hat.float(), latents_x0.float(), reduction='mean') * weight)
 
     # Ensure the returned loss is float32 for a stable backward pass under AMP/bfloat16.
-    # Some optimizers/backward paths expect a Float (fp32) scalar loss.
-    # Also upcast any bf16 losses accumulated above to fp32 before the final mean.
     losses = [l.float() for l in losses]
     loss = sum(losses) / len(losses)
     return loss
