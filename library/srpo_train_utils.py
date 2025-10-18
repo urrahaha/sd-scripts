@@ -188,7 +188,23 @@ def srpo_train_step_sdxl(
     timestep_length = getattr(args, 'srpo_timestep_length', 100)
     discount_pos = getattr(args, 'srpo_discount_pos', [0.1, 0.25])
     discount_inv = getattr(args, 'srpo_discount_inv', [0.3, 0.01])
-    train_timestep_range = getattr(args, 'srpo_train_timestep', [5, 25])
+    # Support percentage-based training window for consistency across different
+    # --srpo_timestep_length settings. If provided, map [0,1] -> [0, T-1].
+    if getattr(args, 'srpo_train_timestep_pct', None) is not None:
+        pct = getattr(args, 'srpo_train_timestep_pct')
+        try:
+            p0, p1 = float(pct[0]), float(pct[1])
+        except Exception:
+            p0, p1 = 0.05, 0.25
+        p0 = max(0.0, min(1.0, p0))
+        p1 = max(0.0, min(1.0, p1))
+        if p1 < p0:
+            p0, p1 = p1, p0
+        lo_idx = int(round(p0 * max(1, timestep_length - 1)))
+        hi_idx = int(round(p1 * max(1, timestep_length - 1)))
+        train_timestep_range = [lo_idx, hi_idx]
+    else:
+        train_timestep_range = getattr(args, 'srpo_train_timestep', [5, 25])
     groundtruth_ratio = getattr(args, 'srpo_groundtruth_ratio', 0.9)
     guidance_scale = getattr(args, 'srpo_guidance_scale', 3.5)
     reward_threshold = getattr(args, 'srpo_reward_threshold', 0.7)

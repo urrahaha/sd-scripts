@@ -2281,6 +2281,19 @@ def setup_parser() -> argparse.ArgumentParser:
         default=[5, 25],
         help="Timestep range for training [start, end] / 学習のタイムステップ範囲 [開始, 終了]",
     )
+    # Optional: allow specifying the training range as percentages so it stays
+    # consistent when --srpo_timestep_length changes. Values should be in [0,1].
+    # If provided, this takes precedence over --srpo_train_timestep.
+    parser.add_argument(
+        "--srpo_train_timestep_pct",
+        type=float,
+        nargs=2,
+        default=None,
+        help=(
+            "Training timestep range as percentages [start, end] in [0,1]. "
+            "Overrides --srpo_train_timestep when set. Example: 0.15 0.60"
+        ),
+    )
     parser.add_argument(
         "--srpo_groundtruth_ratio",
         type=float,
