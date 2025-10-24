@@ -482,6 +482,22 @@ def create_network(
     if module_dropout is not None:
         module_dropout = float(module_dropout)
 
+    # rsLoRA alpha remapping (alpha -> alpha * sqrt(rank))
+    def _truthy(v: object) -> bool:
+        return str(v).lower() in {"1", "true", "yes", "y", "on"}
+
+    use_rslora = _truthy(kwargs.get("rslora", False) or kwargs.get("use_rslora", False))
+    if use_rslora:
+        if network_dim is not None and network_alpha is not None:
+            network_alpha = float(network_alpha) * math.sqrt(int(network_dim))
+        if conv_dim is not None and conv_alpha is not None:
+            conv_alpha = float(conv_alpha) * math.sqrt(int(conv_dim))
+        if block_alphas is not None and block_dims is not None:
+            block_alphas = [float(a) * math.sqrt(int(d)) for a, d in zip(block_alphas, block_dims)]
+        if conv_block_alphas is not None and conv_block_dims is not None:
+            conv_block_alphas = [float(a) * math.sqrt(int(d)) for a, d in zip(conv_block_alphas, conv_block_dims)]
+        logger.info("RSLoRA enabled (LoRA-FA): mapped alphas by sqrt(rank)")
+
     # すごく引数が多いな ( ^ω^)･･･
     network = LoRANetwork(
         text_encoder,
