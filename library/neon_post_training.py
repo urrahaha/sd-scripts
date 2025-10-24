@@ -4,13 +4,20 @@ Neon Post-Training Loop
 Runs additional training on synthetic dataset to create auxiliary model.
 """
 
-import math
 import torch
 from pathlib import Path
 import logging
 import os
 from library.device_utils import clean_memory_on_device
 from library import train_util, sdxl_train_util
+from library.custom_train_functions import (
+    add_v_prediction_like_loss,
+    apply_debiased_estimation,
+    apply_snr_weight,
+    fix_noise_scheduler_betas_for_zero_terminal_snr,
+    prepare_scheduler_for_custom_training,
+    scale_v_prediction_loss_like_noise_prediction,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +68,11 @@ def run_post_training_loop(
     logger.info("Preparing models for post-training (optimizing memory)...")
     device = accelerator.device
     use_low_vram = bool(getattr(args, "lowram", False) or getattr(args, "neon_low_vram", False))
+
+    # Align scheduler behavior with primary training scripts
+    prepare_scheduler_for_custom_training(noise_scheduler, device)
+    if getattr(args, "zero_terminal_snr", False):
+        fix_noise_scheduler_betas_for_zero_terminal_snr(noise_scheduler)
 
     # Save original device placements
     unet_device = unet.device
@@ -153,11 +165,12 @@ def run_post_training_loop(
 
                 latents = latents.to(dtype=weight_dtype)
                 
-                # In low-VRAM mode, move VAE off and bring UNet/Text Encoders in for the step
+                # Free memory more aggressively only when operating in low-VRAM mode
                 if use_low_vram:
                     vae.to("cpu")
                     clean_memory_on_device(device)
-
+                else:
+                    # Keep primary models resident on device for smoother allocator usage
                     if isinstance(text_encoder, (list, tuple)):
                         for te in text_encoder:
                             te.to(device)
@@ -210,7 +223,7 @@ def run_post_training_loop(
                             repeat_factor = (bsz + pool2.shape[0] - 1) // pool2.shape[0]
                             pool2 = pool2.repeat_interleave(repeat_factor, dim=0)[:bsz]
 
-                        vector_embeddings = torch.cat([pool2, size_embeddings], dim=1)
+                        vector_embeddings = torch.cat([pool2, size_embeddings], dim=1).to(weight_dtype)
                     else:
                         hs = []
                         for i, encoder in enumerate(text_encoder):
@@ -244,21 +257,16 @@ def run_post_training_loop(
                         except Exception:
                             pass
 
-                # Sample noise
-                noise = torch.randn_like(latents)
-                
-                # Sample timestep
-                bsz = latents.shape[0]
-                timesteps = torch.randint(
-                    0,
-                    noise_scheduler.config.num_train_timesteps,
-                    (bsz,),
-                    device=latents.device,
+                # pixel_values are no longer needed past this point; drop the reference to keep allocator steady
+                del pixel_values
+
+                # Ensure embeddings use compute dtype to save VRAM
+                encoder_hidden_states = encoder_hidden_states.to(accelerator.device, dtype=weight_dtype)
+
+                # Sample noise, timesteps, and noisy latents using shared utility (handles noise offset, IP noise, etc.)
+                noise, noisy_latents, timesteps = train_util.get_noise_noisy_latents_and_timesteps(
+                    args, noise_scheduler, latents
                 )
-                timesteps = timesteps.long()
-                
-                # Add noise to latents
-                noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
                 
                 # Predict noise (mixed precision)
                 with accelerator.autocast():
@@ -278,12 +286,53 @@ def run_post_training_loop(
 
                 noise_pred = noise_pred_out.sample if hasattr(noise_pred_out, "sample") else noise_pred_out
                 
-                # Compute loss
-                loss = torch.nn.functional.mse_loss(
+                # Compute loss with repo-standard options (v-pred, huber, SNR weighting, etc.)
+                huber_c = train_util.get_huber_threshold_if_needed(args, timesteps, noise_scheduler)
+                if getattr(args, "v_parameterization", False):
+                    target = noise_scheduler.get_velocity(latents, noise, timesteps)
+                else:
+                    target = noise
+
+                loss = train_util.conditional_loss(
                     noise_pred.float(),
-                    noise.float(),
-                    reduction="mean"
+                    target.float(),
+                    getattr(args, "loss_type", "l2"),
+                    "none",
+                    huber_c,
                 )
+
+                # Reduce to per-sample loss
+                if loss.ndim > 1:
+                    reduce_dims = tuple(range(1, loss.ndim))
+                    loss = loss.mean(dim=reduce_dims)
+
+                # Apply optional loss transforms
+                min_snr_gamma = getattr(args, "min_snr_gamma", None)
+                if min_snr_gamma is not None:
+                    loss = apply_snr_weight(
+                        loss,
+                        timesteps,
+                        noise_scheduler,
+                        min_snr_gamma,
+                        getattr(args, "v_parameterization", False),
+                    )
+
+                if getattr(args, "scale_v_pred_loss_like_noise_pred", False):
+                    loss = scale_v_prediction_loss_like_noise_prediction(loss, timesteps, noise_scheduler)
+
+                v_pred_like = getattr(args, "v_pred_like_loss", None)
+                if v_pred_like is not None:
+                    loss = add_v_prediction_like_loss(loss, timesteps, noise_scheduler, v_pred_like)
+
+                if getattr(args, "debiased_estimation_loss", False):
+                    loss = apply_debiased_estimation(
+                        loss,
+                        timesteps,
+                        noise_scheduler,
+                        getattr(args, "v_parameterization", False),
+                    )
+
+                loss = loss.mean()
                 
                 # Backward pass
                 accelerator.backward(loss)
