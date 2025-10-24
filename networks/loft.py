@@ -57,18 +57,21 @@ class LoFTModule(torch.nn.Module):
             # V^T : in->rank with source kernel size; U : rank->out with 1x1
             self.lora_down = torch.nn.Conv2d(in_dim, self.rank, kernel_size, stride, padding, bias=False)
             self.lora_up = torch.nn.Conv2d(self.rank, out_dim, (1, 1), (1, 1), bias=False)
+            self.base_type = "conv"
         else:
             in_dim = org_module.in_features
             out_dim = org_module.out_features
             self.lora_down = torch.nn.Linear(in_dim, self.rank, bias=False)
             self.lora_up = torch.nn.Linear(self.rank, out_dim, bias=False)
+            self.base_type = "linear"
 
-        # LoFT uses same scaling as LoRA for inference compatibility
+        # LoFT forward uses no α/rank scaling (W = W0 + U V^T).
+        # Keep `alpha` only for serialization/backcompat; do not use for forward.
         if isinstance(alpha, torch.Tensor):
             alpha = alpha.detach().float().item()
         alpha = self.rank if alpha is None or alpha == 0 else float(alpha)
-        self.scale = alpha / self.rank
         self.register_buffer("alpha", torch.tensor(alpha))
+        self.scale = 1.0  # no forward scaling in LoFT
 
         # init like LoRA
         torch.nn.init.kaiming_uniform_(self.lora_down.weight, a=math.sqrt(5))
@@ -87,6 +90,9 @@ class LoFTModule(torch.nn.Module):
         self._u_hook = None
         self._v_hook = None
         self.enabled = True
+        self._clip_value: Optional[float] = None  # projected gradient clip (Block 6)
+        self._gram_inv = None  # cached r x r inverse for current step
+        self._peer2d_cache = None
 
     # --- helpers ---
     @staticmethod
@@ -128,38 +134,86 @@ class LoFTModule(torch.nn.Module):
         eps = 1e-6
         if update_u:
             # scale grad_U := grad_U @ (V^T V + eps I)^{-1}
+            # precompute gram inverse once per step (V is frozen during U-step)
+            try:
+                Vt = self._to_2d(self.lora_down.weight)
+                Vt32 = Vt.float()
+                gram32 = Vt32 @ Vt32.t()
+                gram32 = gram32 + eps * torch.eye(gram32.shape[0], device=gram32.device, dtype=torch.float32)
+                self._gram_inv = torch.linalg.inv(gram32)
+                self._peer2d_cache = Vt32
+            except Exception:
+                self._gram_inv = None
+                self._peer2d_cache = None
             def _u_grad_hook(grad: torch.Tensor) -> torch.Tensor:
                 if not getattr(self, "_use_full", True):
                     return grad
-                Vt = self._to_2d(self.lora_down.weight)  # [r, in*kw*kh]
-                Vt32 = Vt.float()
-                gram32 = Vt32 @ Vt32.t()  # [r, r] == V^T V
-                gram32 = gram32 + eps * torch.eye(gram32.shape[0], device=gram32.device, dtype=torch.float32)
-                gram_inv32 = torch.linalg.inv(gram32)
+                gram_inv32 = self._gram_inv
+                Vt32 = self._peer2d_cache
+                if gram_inv32 is None or Vt32 is None:
+                    Vt = self._to_2d(self.lora_down.weight)
+                    Vt32 = Vt.float()
+                    gram32 = Vt32 @ Vt32.t()
+                    gram32 = gram32 + eps * torch.eye(gram32.shape[0], device=gram32.device, dtype=torch.float32)
+                    gram_inv32 = torch.linalg.inv(gram32)
                 if grad.dim() > 2:
                     g2d = grad.flatten(1).float()
-                    g2d = g2d @ gram_inv32
-                    return g2d.to(dtype=grad.dtype).view_as(grad)
                 else:
-                    return (grad.float() @ gram_inv32).to(dtype=grad.dtype)
+                    g2d = grad.float()
+                g2d = g2d @ gram_inv32
+                # Projected gradient clipping (Block 6, optional)
+                clip_val = getattr(self, "_clip_value", None)
+                if clip_val is not None and clip_val > 0:
+                    Vt2 = Vt32  # [r, d]
+                    geff = g2d @ Vt2  # [out, d]
+                    fn = torch.linalg.norm(geff, ord="fro")
+                    if torch.isfinite(fn) and fn > 0:
+                        scale = min(1.0, float(clip_val) / float(fn))
+                        if scale < 1.0:
+                            g2d = g2d * scale
+                return g2d.to(dtype=grad.dtype).view_as(grad)
 
             self._u_hook = self.lora_up.weight.register_hook(_u_grad_hook)
         else:
             # scale grad_{V^T} := (U^T U + eps I)^{-1} @ grad_{V^T}
+            # precompute gram inverse once per step (U is frozen during V-step)
+            try:
+                U = self._to_2d(self.lora_up.weight)
+                U32 = U.float()
+                gram32 = U32.t() @ U32
+                gram32 = gram32 + eps * torch.eye(gram32.shape[0], device=gram32.device, dtype=torch.float32)
+                self._gram_inv = torch.linalg.inv(gram32)
+                self._peer2d_cache = U32
+            except Exception:
+                self._gram_inv = None
+                self._peer2d_cache = None
             def _v_grad_hook(grad: torch.Tensor) -> torch.Tensor:
                 if not getattr(self, "_use_full", True):
                     return grad
-                U = self._to_2d(self.lora_up.weight)  # [out, r]
-                U32 = U.float()
-                gram32 = U32.t() @ U32  # [r, r] == U^T U
-                gram32 = gram32 + eps * torch.eye(gram32.shape[0], device=gram32.device, dtype=torch.float32)
-                gram_inv32 = torch.linalg.inv(gram32)
+                gram_inv32 = self._gram_inv
+                U32 = self._peer2d_cache
+                if gram_inv32 is None or U32 is None:
+                    U = self._to_2d(self.lora_up.weight)
+                    U32 = U.float()
+                    gram32 = U32.t() @ U32
+                    gram32 = gram32 + eps * torch.eye(gram32.shape[0], device=gram32.device, dtype=torch.float32)
+                    gram_inv32 = torch.linalg.inv(gram32)
                 if grad.dim() > 2:
                     g2d = grad.flatten(1).float()
-                    g2d = gram_inv32 @ g2d
-                    return g2d.to(dtype=grad.dtype).view_as(grad)
                 else:
-                    return (gram_inv32 @ grad.float()).to(dtype=grad.dtype)
+                    g2d = grad.float()
+                g2d = gram_inv32 @ g2d
+                # Projected gradient clipping (Block 6, optional)
+                clip_val = getattr(self, "_clip_value", None)
+                if clip_val is not None and clip_val > 0:
+                    U2 = U32  # [m, r]
+                    geff = U2 @ g2d  # [m, d]
+                    fn = torch.linalg.norm(geff, ord="fro")
+                    if torch.isfinite(fn) and fn > 0:
+                        scale = min(1.0, float(clip_val) / float(fn))
+                        if scale < 1.0:
+                            g2d = g2d * scale
+                return g2d.to(dtype=grad.dtype).view_as(grad)
 
             self._v_hook = self.lora_down.weight.register_hook(_v_grad_hook)
 
@@ -172,7 +226,8 @@ class LoFTModule(torch.nn.Module):
         if self.dropout is not None and self.training:
             lx = torch.nn.functional.dropout(lx, p=self.dropout)
         lx = self.lora_up(lx)
-        return org_forwarded + lx * self.multiplier * self.scale
+        # LoFT: direct addition without α/rank scaling; `multiplier` retained for user control
+        return org_forwarded + lx * self.multiplier
 
 
 class LoFTNetwork(torch.nn.Module):
@@ -201,6 +256,9 @@ class LoFTNetwork(torch.nn.Module):
         modules_alpha: Optional[Dict[str, float]] = None,
         verbose: bool = True,
         is_sdxl: bool = True,
+        projected_clip_norm: Optional[float] = None,
+        include_conv3x3: bool = True,
+        projection_linear_only: bool = False,
     ) -> None:
         super().__init__()
         self.multiplier = multiplier
@@ -208,6 +266,9 @@ class LoFTNetwork(torch.nn.Module):
         self.alpha = alpha
         self.dropout = dropout
         self.is_sdxl = is_sdxl
+        self.projected_clip_norm = projected_clip_norm
+        self.include_conv3x3 = include_conv3x3
+        self.projection_linear_only = projection_linear_only
         self._update_u = False  # will be set on first step in prepare_grad_etc
         self._adamw_full = False
 
@@ -277,7 +338,8 @@ class LoFTNetwork(torch.nn.Module):
 
         # U-Net
         target_modules = list(self.UNET_TARGET_REPLACE_MODULE)
-        target_modules += self.UNET_TARGET_REPLACE_MODULE_CONV2D_3X3  # allow conv 3x3 path
+        if self.include_conv3x3:
+            target_modules += self.UNET_TARGET_REPLACE_MODULE_CONV2D_3X3  # allow conv 3x3 path
         self.unet_lofts, skipped_un = create_modules(True, None, unet, target_modules)
         if verbose:
             logger.info(f"create LoFT for U-Net: {len(self.unet_lofts)} modules")
@@ -368,21 +430,20 @@ class LoFTNetwork(torch.nn.Module):
         return self.parameters()
 
     def prepare_network(self, args):
+        # Enable LoFT projected gradient hooks regardless of optimizer; hooks are optimizer-agnostic.
         opt = getattr(args, "optimizer_type", None)
-        if opt is None or opt == "":
-            self._adamw_full = True
-        else:
-            self._adamw_full = opt.lower() == "adamw"
+        self._adamw_full = True
+        logger.info(
+            f"LoFT: enabling projected-gradient hooks for optimizer_type='{opt}' (optimizer-agnostic)"
+        )
 
-        if self._adamw_full:
-            logger.info("LoFT: using AdamW full behavior (projection hooks enabled)")
-        else:
-            logger.info(f"LoFT: AdamW full disabled for optimizer_type='{opt}' (projection hooks disabled)")
-
-        use_full = bool(self._adamw_full)
         for m in self.text_encoder_lofts + self.unet_lofts:
             try:
+                # optionally restrict projection to linear layers only to reduce overhead
+                use_full = True if not self.projection_linear_only else (getattr(m, "base_type", "linear") == "linear")
                 setattr(m, "_use_full", use_full)
+                # optional projected clipping: use network arg `projected_clip_norm`, fallback to None
+                setattr(m, "_clip_value", self.projected_clip_norm)
             except Exception:
                 pass
 
@@ -391,6 +452,29 @@ class LoFTNetwork(torch.nn.Module):
             metadata = None
 
         state_dict = self.state_dict()
+        # Keep only the expected public LoRA-compatible tensors. This prevents any
+        # accidental runtime caches (e.g., "_peer2d_cache", "_gram_inv") from being
+        # serialized if they were ever registered as buffers by a fork or older build.
+        allowed_suffixes = (".alpha", ".lora_up.weight", ".lora_down.weight")
+        state_dict = {k: v for k, v in state_dict.items() if k.endswith(allowed_suffixes)}
+        # Ensure LoFT exports have alpha==rank so external LoRA loaders (which apply alpha/r)
+        # will use scale==1 at inference. This avoids under-scaled LoFT when loaded elsewhere.
+        try:
+            # Build a quick map name -> rank from lora_down.weight shapes
+            ranks: Dict[str, int] = {}
+            for key, value in state_dict.items():
+                if key.endswith(".lora_down.weight"):
+                    name = key.split(".")[0]
+                    ranks[name] = int(value.size(0))
+            # Overwrite alpha buffers accordingly
+            for key in list(state_dict.keys()):
+                if key.endswith(".alpha"):
+                    name = key.split(".")[0]
+                    r = ranks.get(name, None)
+                    if r is not None:
+                        state_dict[key] = torch.tensor(float(r))
+        except Exception:
+            pass
         if dtype is not None:
             for k in list(state_dict.keys()):
                 v = state_dict[k]
@@ -427,9 +511,10 @@ class LoFTNetwork(torch.nn.Module):
         for i in range(len(downkeys)):
             down = state_dict[downkeys[i]].to(device)
             up = state_dict[upkeys[i]].to(device)
-            alpha = state_dict[alphakeys[i]].to(device)
-            dim = down.shape[0]
-            scale = alpha / dim
+            # LoFT forward has no α/rank scaling; use scale=1 for norm computation
+            # `alpha` is retained for backcompat in state_dict but not applied here
+            _ = state_dict[alphakeys[i]].to(device)
+            scale = 1.0
 
             if up.dim() == 4 and down.dim() == 4 and up.shape[2:] == (1, 1) and down.shape[2:] == down.shape[2:]:
                 updown = (up.squeeze(3).squeeze(2) @ down.flatten(1)).unsqueeze(2).unsqueeze(3)
@@ -476,6 +561,32 @@ def create_network(
     if network_alpha is None:
         network_alpha = 1.0
 
+    # allow projected Clip norm via `network_args` (e.g., projected_clip_norm=1.0)
+    projected_clip_norm = None
+    if "projected_clip_norm" in kwargs:
+        try:
+            projected_clip_norm = float(kwargs["projected_clip_norm"])
+        except Exception:
+            projected_clip_norm = None
+
+    # include_conv3x3 to control UNet Conv3x3 coverage
+    include_conv3x3 = True
+    if "include_conv3x3" in kwargs:
+        try:
+            v = kwargs["include_conv3x3"]
+            include_conv3x3 = (str(v).lower() != "false" and str(v) != "0")
+        except Exception:
+            include_conv3x3 = True
+
+    # projection_linear_only to reduce overhead by projecting only linear layers
+    projection_linear_only = False
+    if "projection_linear_only" in kwargs:
+        try:
+            v = kwargs["projection_linear_only"]
+            projection_linear_only = (str(v).lower() not in {"false", "0"})
+        except Exception:
+            projection_linear_only = False
+
     network = LoFTNetwork(
         text_encoder,
         unet,
@@ -487,6 +598,9 @@ def create_network(
         modules_alpha=None,
         verbose=True,
         is_sdxl=is_sdxl,
+        projected_clip_norm=projected_clip_norm,
+        include_conv3x3=include_conv3x3,
+        projection_linear_only=projection_linear_only,
     )
     return network
 
