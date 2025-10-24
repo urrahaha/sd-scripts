@@ -5260,6 +5260,36 @@ def get_optimizer(args, trainable_params) -> tuple[str, str, object]:
         # make optimizer as train mode before training for schedulefree optimizer. the optimizer will be in eval mode in sampling and saving.
         optimizer.train()
 
+    # Patch optimizer for LoFT state calibration if LoFT-tagged params are present
+    try:
+        from library.optim.loft_opt_patch import patch_optimizer_for_loft
+        # read toggle from network_args (if provided)
+        loft_transport_enabled = True
+        loft_transport_flag_path = None
+        try:
+            if getattr(args, "network_args", None):
+                for net_arg in args.network_args:
+                    if "=" in net_arg:
+                        key, value = net_arg.split("=", 1)
+                    else:
+                        key, value = net_arg, "1"
+                    if key == "loft_state_transport":
+                        v = str(value).strip().lower()
+                        loft_transport_enabled = v not in {"0", "false", "off"}
+                    elif key == "loft_transport_flag_path":
+                        loft_transport_flag_path = value
+        except Exception:
+            pass
+
+        optimizer = patch_optimizer_for_loft(
+            optimizer,
+            enabled=loft_transport_enabled,
+            flag_path=loft_transport_flag_path,
+        )
+    except Exception as e:
+        # Be robust: if patching fails, continue with original optimizer
+        logger.debug(f"LoFT optimizer patch skipped due to error: {e}")
+
     return optimizer_name, optimizer_args, optimizer
 
 
