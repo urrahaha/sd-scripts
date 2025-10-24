@@ -283,7 +283,8 @@ class NLoraNetwork(LoRANetwork):
                 if n is not None:
                     up2 = up2 @ n.squeeze(2).squeeze(2)
                 updown = (up2 @ down.squeeze(2).squeeze(2)).unsqueeze(2).unsqueeze(3)
-            elif up.shape[2:] == (1, 1) or down.shape[2:] == (3, 3):
+            # conv2d kxk (currently k=3) case: down is kxk and up is 1x1
+            elif up.shape[2:] == (3, 3) or down.shape[2:] == (3, 3):
                 up2 = up
                 if n is not None:
                     up2 = (up.squeeze(3).squeeze(2) @ n.squeeze(3).squeeze(2)).unsqueeze(2).unsqueeze(3)
@@ -367,6 +368,22 @@ def create_network(
     module_dropout = kwargs.get("module_dropout", None)
     if module_dropout is not None:
         module_dropout = float(module_dropout)
+
+    # rsLoRA alpha remapping (alpha -> alpha * sqrt(rank))
+    def _truthy(v: object) -> bool:
+        return str(v).lower() in {"1", "true", "yes", "y", "on"}
+
+    use_rslora = _truthy(kwargs.get("rslora", False) or kwargs.get("use_rslora", False))
+    if use_rslora:
+        if network_dim is not None and network_alpha is not None:
+            network_alpha = float(network_alpha) * math.sqrt(int(network_dim))
+        if conv_dim is not None and conv_alpha is not None:
+            conv_alpha = float(conv_alpha) * math.sqrt(int(conv_dim))
+        if block_alphas is not None and block_dims is not None:
+            block_alphas = [float(a) * math.sqrt(int(d)) for a, d in zip(block_alphas, block_dims)]
+        if conv_block_alphas is not None and conv_block_dims is not None:
+            conv_block_alphas = [float(a) * math.sqrt(int(d)) for a, d in zip(conv_block_alphas, conv_block_dims)]
+        # No special casing for NLora's extra N matrix: scale is still alpha/r in base LoRA math
 
     network = NLoraNetwork(
         text_encoder,
